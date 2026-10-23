@@ -20,25 +20,41 @@ over the copy inside the release.
 | `deb` / `rpm`, started through systemd | `/var/lib/emqx/patches` |
 | Portable `tar.gz` | `<install-dir>/data/patches` |
 
-Verify the download, copy it in, then load it on the running node:
+Verify the download, copy it in, then **restart the node**:
 
 ```sh
 sha256sum -c <module>.beam.sha256
 cp <module>.beam <patches-dir>/
+# then restart the node
+```
+
+A restart is the recommended way to activate a patch. The patches directory is ahead of the release
+on the code path, so the restarted node loads the patched module at boot, and the restart also
+closes every connection that was opened before the patch. Nothing else is needed.
+
+If you cannot restart, you can load the module into the running node instead:
+
+```sh
 emqx eval 'c:l(<module>).'
 ```
 
-Expect `{module,<module>}`. `c:l/1` loads the module on the node it runs against only, so repeat
-this on every node of the cluster.
+Expect `{module,<module>}`. A live reload acts on new work only; anything the old module already set
+up — open connections, cached state — is not revisited, so the patch README will tell you what to
+recycle afterwards. Use this path only if you understand what the node is doing.
 
-A patch copied into a running container is lost when the container is recreated. Add it to your
-image or deployment as well.
+Both the restart and the live reload act on one node. Repeat on every node of the cluster, one at a
+time.
 
-**Some patches need more than loading the module.** A patch may require a step before the module is
-loaded, after it, or both — restarting a connector, clearing a cache, reloading a configuration, or
-recycling connections that a reload does not revalidate. Read the `README.md` in the patch
-directory in full before you start, and follow its steps in the order given. The commands above are
-the common part, not the whole procedure.
+**Make the patch part of your deployment, not only of the running node.** A container recreated
+from the image, a pod rescheduled by Kubernetes, or a node redeployed from your tooling starts from
+the image again and silently loses the file. Bake it into your image, mount it from a volume or
+ConfigMap, or add the copy to your deployment scripts. Copying it into a live container is the
+immediate fix; this is the step that keeps it fixed.
+
+**Some patches need more than installing the module.** A patch may require a step before or after
+the node picks the module up — restarting a connector, clearing a cache, reloading a configuration.
+Read the `README.md` in the patch directory in full before you start, and follow its steps in the
+order given. The commands above are the common part, not the whole procedure.
 
 ## Apply a patch only to the versions it names
 

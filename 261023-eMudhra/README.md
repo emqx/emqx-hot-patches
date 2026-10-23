@@ -19,8 +19,10 @@ SHA-256 of the two roots: `emSign ECC Root CA - G3` is
 `D7A7A0FB5D7E2731D771E9484EBCDEF71D5F0C3E0A2948782BC83EE0EA699EF4`. Both were withdrawn after
 private keys in the eMudhra hierarchy were exposed.
 
-Each file here is the `certifi` version its line ships, with the compromised roots that version
-contains removed. Nothing else changes.
+Each file here is built from the `certifi` release your line already ships, with the compromised
+roots taken out and nothing else changed. 5.x ships 2.10.0, which contains two compromised roots,
+so the 5.x files are 2.10.0 without those two. 6.x ships 2.15.0, which contains one, so the 6.x
+files are 2.15.0 without it.
 
 Editing `priv/cacerts.pem` inside the release does not work, which is why compiled modules are
 published here. `certifi` embeds its certificates into `certifi.beam` through the `certifi_pt`
@@ -69,10 +71,25 @@ The patches directory is given in the repository README. For Docker:
 sha256sum -c certifi.beam.sha256
 docker cp certifi.beam <container>:/opt/emqx/data/patches/certifi.beam
 docker exec -u 0 <container> chown emqx:emqx /opt/emqx/data/patches/certifi.beam
+docker restart <container>
+```
+
+**Make the file part of your deployment, not only of the running container.** A container recreated
+from the image loses it, and the node is back to the unpatched trust store with nothing to tell you
+so. Bake it into your image, mount it at `/opt/emqx/data/patches/certifi.beam`, or add the copy to
+your deployment scripts.
+
+The restart is the recommended way to activate the patch: the restarted node loads the patched
+module at boot and closes every connection opened under the old trust store. If you cannot restart,
+load the module live instead and then recycle the connectors yourself:
+
+```sh
 docker exec <container> /opt/emqx/bin/emqx eval 'c:l(certifi).'
 ```
 
-Expect `{module,certifi}`.
+Expect `{module,certifi}`. A live reload changes what new TLS connections trust, but a connection
+already open in a `hackney` pool is not revalidated, so disable and re-enable every affected
+connector afterwards. Use this path only if you understand what the node is doing.
 
 ## Verifying that it took effect
 
@@ -83,9 +100,7 @@ docker exec <container> /opt/emqx/bin/emqx eval 'length(certifi:cacerts()).'
 Expect **140** on 5.8, 5.9 and 5.10, and **142** on 6.x. The unpatched counts are 142 and 143
 respectively; seeing one of those means the patch is not in effect.
 
-Repeat the installation and this check on every node of the cluster. Then disable and re-enable the
-affected connectors, or restart the node: a reload changes what new TLS connections trust, but a
-connection already open in a `hackney` pool is not revalidated.
+Repeat the installation and this check on every node of the cluster, one node at a time.
 
 ## Which components this affects
 
