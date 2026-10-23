@@ -123,8 +123,12 @@ by this patch.
 
 ## Docker images also carry an operating system trust store
 
-A Docker image has a second trust store at `/etc/ssl/certs/ca-certificates.crt`, read by the `curl`
-and `openssl` binaries in the image rather than by EMQX. This patch does not change it. Images
+A Docker image has a second trust store at `/etc/ssl/certs/ca-certificates.crt`. This patch does not
+change it. It is read by the `curl` and `openssl` binaries in the image, and also by any connector
+that runs TLS with `verify_peer` and no `cacertfile`: EMQX's own code never reads it, but the `gun`,
+`lhttpc` and `rabbit_common` clients fall back to it when the caller supplies no CA. That covers the
+HTTP action and HTTP authentication, the MQTT bridge, Cluster Link, ExHook, the RabbitMQ, BigQuery,
+Couchbase, GCP Pub/Sub, Snowflake, Azure Event Grid and Bigtable actions, and DynamoDB and Kinesis. Images
 other than the 6.3.2 re-published on 2026-10-22 carry both roots there. The accompanying security
 advisory covers that store.
 
