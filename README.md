@@ -34,6 +34,12 @@ this on every node of the cluster.
 A patch copied into a running container is lost when the container is recreated. Add it to your
 image or deployment as well.
 
+**Some patches need more than loading the module.** A patch may require a step before the module is
+loaded, after it, or both — restarting a connector, clearing a cache, reloading a configuration, or
+recycling connections that a reload does not revalidate. Read the `README.md` in the patch
+directory in full before you start, and follow its steps in the order given. The commands above are
+the common part, not the whole procedure.
+
 ## Apply a patch only to the versions it names
 
 Each patch README lists the EMQX release versions it was built and verified against. Do not use it
