@@ -16,7 +16,7 @@
 ##   1. the member of the dead node stays in the shared subscription table;
 ##   2. half of the messages published to the group are lost;
 ## loads the patched modules into the core node, starts the router helper
-## (routing schema v3 only), and checks that:
+## when it is not running, and checks that:
 ##   3. the patched modules are loaded from the patches directory;
 ##   4. no message is lost;
 ##   5. the router helper finds the dead node and its purge removes the member.
@@ -185,25 +185,15 @@ for m in "${MODULES[@]}"; do
     docker cp -q "$PATCH_DIR/$m.beam" "$CORE:/opt/emqx/data/patches/$m.beam"
 done
 docker exec -u 0 "$CORE" sh -c 'chown emqx:emqx /opt/emqx/data/patches/*.beam'
-ev '
-Mods = [emqx_shared_sub, emqx_router_helper, emqx_router_sup],
-Loaded = [c:l(M) || M <- Mods],
-true = lists:all(fun(M) -> string:find(code:which(M), "/patches/") =/= nomatch end, Mods),
-Helper =
-    case emqx_router:get_schema_vsn() of
-        v3 ->
-            supervisor:start_child(emqx_router_sup, #{
-                id => helper,
-                start => {emqx_router_helper, start_link, []},
-                restart => permanent,
-                shutdown => 5000,
-                type => worker,
-                modules => [emqx_router_helper]
-            });
-        v2 ->
-            already_running
-    end,
-{Loaded, Helper}.'
+PATCH_EVAL='[c:l(M) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]], emqx_router_sup:ensure_helper().'
+for run in first second; do
+    R="$(ev "$PATCH_EVAL" | tr -d '[:space:]')"
+    if [ "$R" = "ok" ]; then
+        pass "the patch command returned ok ($run run)"
+    else
+        fail "the patch command returned $R ($run run)"
+    fi
+done
 
 log "Verifying"
 for m in "${MODULES[@]}"; do

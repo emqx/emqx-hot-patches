@@ -16,7 +16,7 @@ The patch replaces three modules:
 | --- | --- |
 | `emqx_shared_sub` | Dispatch skips a member whose node is not a running cluster member. This takes effect as soon as the module is loaded. |
 | `emqx_router_helper` | Core nodes also look for nodes that are not running but still own shared subscription members, and purge them. |
-| `emqx_router_sup` | Starts the router helper with both routing schemas. |
+| `emqx_router_sup` | Starts the router helper with both routing schemas, and adds `ensure_helper/0`, which starts it on a running node. |
 
 The same change ships in a normal release through
 [emqx/emqx#20056](https://github.com/emqx/emqx/pull/20056) (6.x) and
@@ -67,56 +67,28 @@ helper by itself. Nothing else is needed.
 
 ### Load the modules into the running node
 
-This avoids a restart, and the clients of the node keep their connections. Run it as one command:
+This avoids a restart, and the clients of the node keep their connections:
 
 ```sh
-docker exec <container> /opt/emqx/bin/emqx eval '
-Mods = [emqx_shared_sub, emqx_router_helper, emqx_router_sup],
-Loaded = [c:l(M) || M <- Mods],
-true = lists:all(fun(M) -> string:find(code:which(M), "/patches/") =/= nomatch end, Mods),
-Helper =
-    case emqx_router:get_schema_vsn() of
-        v3 ->
-            supervisor:start_child(emqx_router_sup, #{
-                id => helper,
-                start => {emqx_router_helper, start_link, []},
-                restart => permanent,
-                shutdown => 5000,
-                type => worker,
-                modules => [emqx_router_helper]
-            });
-        v2 ->
-            already_running
-    end,
-{Loaded, Helper}.'
+docker exec <container> /opt/emqx/bin/emqx eval '[c:l(M) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]], emqx_router_sup:ensure_helper().'
 ```
 
-Expect:
-
-```
-{[{module,emqx_shared_sub},{module,emqx_router_helper},{module,emqx_router_sup}],
- {ok,<pid>}}
-```
-
-With routing schema v2 the second element is `already_running`. A second run prints
-`{error,{already_started,<pid>}}`, which is also fine. A `badmatch` error means that at least one
-module was not loaded from the patches directory; check the copy step. In that case the command
-does not start the router helper.
+Expect `ok`. The command loads the three modules and starts the router helper when it is not
+running. It is safe to run again. An `undef` error for `emqx_router_sup:ensure_helper/0` means that
+the patched `emqx_router_sup` was not loaded; check the copy step.
 
 ## Verifying that it took effect
 
 ```sh
-docker exec <container> /opt/emqx/bin/emqx eval '
-{[binary:encode_hex(M:module_info(md5)) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]],
- whereis(emqx_router_helper)}.'
+docker exec <container> /opt/emqx/bin/emqx eval '{[binary:encode_hex(M:module_info(md5)) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]], whereis(emqx_router_helper)}.'
 ```
 
 Expect a pid for the router helper, and these values, in this order:
 
 | Lines | `emqx_shared_sub` | `emqx_router_helper` | `emqx_router_sup` |
 | --- | --- | --- | --- |
-| 5.10, 6.0 | `7F348CE26C13A6774D9F15C9C8E2D4DB` | `CBECA42A9061B8BC02F48EE0D958A374` | `40B1747D9DAADAD4DE324EC8BA1B2A20` |
-| 6.1, 6.2, 6.3 | `689ADCE5CCBB22DD4C9944913B2256C0` | `3E839C20892841184D9BA99D9F7B609D` | `54C7BEBE8EED8A8A082A2FF4ED50974E` |
+| 5.10, 6.0 | `7F348CE26C13A6774D9F15C9C8E2D4DB` | `CBECA42A9061B8BC02F48EE0D958A374` | `321522781030C3FC1841847C0658AC32` |
+| 6.1, 6.2, 6.3 | `689ADCE5CCBB22DD4C9944913B2256C0` | `3E839C20892841184D9BA99D9F7B609D` | `939198EA75044AC0E05A4AA79BCF14E2` |
 
 These are the checksums of the compiled code, which `module_info(md5)` reports. They are not the
 SHA-256 checksums of the files.
@@ -168,7 +140,7 @@ The script passed on every affected version listed above. On 5.10.5 it also pass
 
 The source of the three modules is the same in every affected version, and so is the source after
 the fix on all lines. The modules were built from the fix commit
-[`ae4e7a6bdd`](https://github.com/emqx/emqx/commit/ae4e7a6bdd2a9210a987bb7a750970cd87301fc0),
+[`b74dccaab2`](https://github.com/emqx/emqx/commit/b74dccaab2c4a4f864967065788fb1777de20009),
 with the header files of the latest release of each line (5.10.5, 6.0.4, 6.1.5, 6.2.3, 6.3.3), the
 Mria and snabbkaffe header files that release ships, and the compiler options of the EMQX release
 build:
