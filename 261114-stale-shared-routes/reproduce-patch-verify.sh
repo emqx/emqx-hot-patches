@@ -18,14 +18,15 @@
 ## loads the patched modules into the core node, starts the router helper
 ## when it is not running, and checks that:
 ##   3. the patched modules are loaded from the patches directory;
-##   4. no message is lost;
-##   5. the router helper finds the dead node and its purge removes the member.
+##   4. the router helper finds the dead node and marks it down;
+##   5. no message is lost;
+##   6. a purge removes the member.
 
 set -euo pipefail
 
 VSN="${1:-}"
 if [ -z "$VSN" ]; then
-    sed -n '2,25p' "$0" | sed 's/^## \{0,1\}//'
+    sed -n '2,24p' "$0" | sed 's/^## \{0,1\}//'
     exit 2
 fi
 VSN="${VSN#e}"
@@ -47,7 +48,7 @@ SUB_REPLICANT="${PROJECT}-sub-replicant1"
 CORE_NODE="emqx@core1.hp.emqx.io"
 REPLICANT_NODE="emqx@replicant1.hp.emqx.io"
 MQTTX_IMAGE="emqx/mqttx-cli:latest"
-MODULES=(emqx_shared_sub emqx_router_helper emqx_router_sup)
+MODULES=(emqx_router_helper emqx_router_sup emqx_shared_sub)
 WORK="$(mktemp -d)"
 FAILED=0
 
@@ -185,7 +186,7 @@ for m in "${MODULES[@]}"; do
     docker cp -q "$PATCH_DIR/$m.beam" "$CORE:/opt/emqx/data/patches/$m.beam"
 done
 docker exec -u 0 "$CORE" sh -c 'chown emqx:emqx /opt/emqx/data/patches/*.beam'
-PATCH_EVAL='[c:l(M) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]], emqx_router_sup:ensure_helper().'
+PATCH_EVAL='[c:l(M) || M <- [emqx_router_helper, emqx_router_sup, emqx_shared_sub]], emqx_router_sup:ensure_helper().'
 for run in first second; do
     R="$(ev "$PATCH_EVAL" | tr -d '[:space:]')"
     if [ "$R" = "ok" ]; then
@@ -208,17 +209,17 @@ if is_true "is_pid(whereis(emqx_router_helper))."; then
 else
     fail "the router helper is not running"
 fi
-N="$(publish_10)"
-if [ "$N" -eq 10 ]; then
-    pass "VERIFIED: 10 of 10 messages reached the live member"
-else
-    fail "$N of 10 messages reached the live member"
-fi
 if wait_for 300 "the router helper marks the replicant down" is_true \
     "[S || {ns, '$REPLICANT_NODE', S, _, _} <- ets:tab2list(emqx_router_helper)] =:= [down]."; then
     pass "the router helper found the dead replicant and marked it down"
 else
     fail "the router helper did not mark the dead replicant down"
+fi
+N="$(publish_10)"
+if [ "$N" -eq 10 ]; then
+    pass "VERIFIED: 10 of 10 messages reached the live member"
+else
+    fail "$N of 10 messages reached the live member"
 fi
 if [ "${WAIT_PURGE:-0}" = "1" ]; then
     echo "    Waiting for the periodic purge, up to 25 minutes"

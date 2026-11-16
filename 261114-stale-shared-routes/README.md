@@ -14,8 +14,8 @@ The patch replaces three modules:
 
 | Module | Change |
 | --- | --- |
-| `emqx_shared_sub` | Dispatch skips a member whose node is not a running cluster member. This takes effect as soon as the module is loaded. |
-| `emqx_router_helper` | Core nodes also look for nodes that are not running but still own shared subscription members, and purge them. |
+| `emqx_shared_sub` | Dispatch skips a member on a node that the router helper marks down or left. |
+| `emqx_router_helper` | Every node also looks for nodes that are not running but still own shared subscription members, and marks them down. Core nodes purge them. |
 | `emqx_router_sup` | Starts the router helper with both routing schemas, and adds `ensure_helper/0`, which starts it on a running node. |
 
 The same change ships in a normal release through
@@ -70,32 +70,37 @@ helper by itself. Nothing else is needed.
 This avoids a restart, and the clients of the node keep their connections:
 
 ```sh
-docker exec <container> /opt/emqx/bin/emqx eval '[c:l(M) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]], emqx_router_sup:ensure_helper().'
+docker exec <container> /opt/emqx/bin/emqx eval '[c:l(M) || M <- [emqx_router_helper, emqx_router_sup, emqx_shared_sub]], emqx_router_sup:ensure_helper().'
 ```
 
 Expect `ok`. The command loads the three modules and starts the router helper when it is not
-running. It is safe to run again. An `undef` error for `emqx_router_sup:ensure_helper/0` means that
+running. It is safe to run again. Keep the order of the modules: the patched `emqx_shared_sub` calls
+a function that only the patched `emqx_router_helper` has. An `undef` error for `emqx_router_sup:ensure_helper/0` means that
 the patched `emqx_router_sup` was not loaded; check the copy step.
 
 ## Verifying that it took effect
 
 ```sh
-docker exec <container> /opt/emqx/bin/emqx eval '{[binary:encode_hex(M:module_info(md5)) || M <- [emqx_shared_sub, emqx_router_helper, emqx_router_sup]], whereis(emqx_router_helper)}.'
+docker exec <container> /opt/emqx/bin/emqx eval '{[binary:encode_hex(M:module_info(md5)) || M <- [emqx_router_helper, emqx_router_sup, emqx_shared_sub]], whereis(emqx_router_helper)}.'
 ```
 
 Expect a pid for the router helper, and these values, in this order:
 
-| Lines | `emqx_shared_sub` | `emqx_router_helper` | `emqx_router_sup` |
+| Lines | `emqx_router_helper` | `emqx_router_sup` | `emqx_shared_sub` |
 | --- | --- | --- | --- |
-| 5.10, 6.0 | `7F348CE26C13A6774D9F15C9C8E2D4DB` | `CBECA42A9061B8BC02F48EE0D958A374` | `321522781030C3FC1841847C0658AC32` |
-| 6.1, 6.2, 6.3 | `689ADCE5CCBB22DD4C9944913B2256C0` | `3E839C20892841184D9BA99D9F7B609D` | `939198EA75044AC0E05A4AA79BCF14E2` |
+| 5.10, 6.0 | `97304F6BA819F5AA4EA3C144C9251C9C` | `321522781030C3FC1841847C0658AC32` | `5A001C50BAEA6244369F758E41E2565F` |
+| 6.1, 6.2, 6.3 | `402B7F4E7F036EAB5BC333D148B3E4B6` | `939198EA75044AC0E05A4AA79BCF14E2` | `47CB34BB84C4E4FCC9BD9AA450A8E167` |
 
 These are the checksums of the compiled code, which `module_info(md5)` reports. They are not the
 SHA-256 checksums of the files.
 
 ## What to expect after patching
 
-- Dispatch skips the members of a node that is not running as soon as `emqx_shared_sub` is loaded.
+- Dispatch skips the members of a node once the router helper of the dispatching node marks the
+  node down or left. For a node that goes down while the helper runs, this happens at once. For a
+  node that was already down when the helper started, as on a node that was just patched, it
+  happens at the first scan, about 10 seconds after the helper starts. The helper scans again about
+  every 2 minutes.
 - A core node purges the members of a replicant that has been down for 15 minutes. Members found
   by the periodic scan (about every 2 minutes) are purged 15 minutes after they are found.
 - The members of a node that left the cluster are purged within about 15 seconds.
@@ -128,22 +133,21 @@ describes. The fix is planned for 5.10.6, 6.0.5, 6.1.6, 6.2.4 and 6.3.4.
 subscription group on each node with `mqttx`, and kills the replicant. On the unpatched core node it
 checks that the member of the dead replicant stays and that half of the messages to the group are
 lost. It then copies the modules into the core node, loads them with the command above, and checks
-that the modules are loaded, that no message is lost, that the router helper marks the replicant
-down, and that a purge removes its member.
+that the modules are loaded, that the router helper marks the replicant down, that no message is
+lost, and that a purge removes its member.
 
 The script triggers the purge with `emqx_router_helper:schedule_force_purge()` instead of waiting
 15 minutes. Set `WAIT_PURGE=1` to wait for the periodic purge.
 
-The script passed on every affected version listed above. On 5.10.5 it also passed with `WAIT_PURGE=1`.
+The script passed on every affected version listed above. On 6.3.3 it also passed with `WAIT_PURGE=1`.
 
 ## How these files were built
 
 The source of the three modules is the same in every affected version, and so is the source after
 the fix on all lines. The modules were built from the fix commit
-[`b74dccaab2`](https://github.com/emqx/emqx/commit/b74dccaab2c4a4f864967065788fb1777de20009),
+[`9f416f2567`](https://github.com/emqx/emqx/commit/9f416f256752d6ed05dfc3298ce2b2d694df9466),
 with the header files of the latest release of each line (5.10.5, 6.0.4, 6.1.5, 6.2.3, 6.3.3), the
-Mria and snabbkaffe header files that release ships, and the compiler options of the EMQX release
-build:
+snabbkaffe header file that release ships, and the compiler options of the EMQX release build:
 
 ```sh
 erlc +debug_info +compressed +deterministic +warnings_as_errors \
