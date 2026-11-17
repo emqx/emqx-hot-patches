@@ -89,3 +89,4 @@ the patch README.
 | --- | --- |
 | [`261023-eMudhra`](261023-eMudhra) | Removes a withdrawn eMudhra root certificate from the CA trust store bundled in the EMQX release. |
 | [`261114-stale-shared-routes`](261114-stale-shared-routes) | Removes the shared subscription members of nodes that left the cluster or stay down, and stops dispatching messages to them, with routing schema v3. |
+| [`261117-kafka-noack-alias`](261117-kafka-noack-alias) | Stops growing memory use in Kafka and Confluent producer actions with acknowledgments disabled, on EMQX Enterprise 5.8.11. Includes Kubernetes installation and rollback instructions. |
