@@ -10,17 +10,29 @@ be dispatched to these members, and these messages are lost, at every QoS level.
 The cleanup of these members was done by the router helper process. Since the versions below, that
 process is not started with routing schema v3, so nothing removes them.
 
+Since the update of 2026-11-18, the patch also fixes a shared subscription member of a live
+replicant node that is lost from the cluster. This happens to a member that subscribed during a
+network partition, when the cluster heals. It can also happen when a core node removes the members
+of a replicant that it sees down for 15 minutes, while the replicant is alive behind a partition.
+The member then receives no message until its client unsubscribes and subscribes again. With the
+patch, each node writes its missing members back.
+
+**If you installed this patch before 2026-11-18,** replace the files of `emqx_router_helper` and
+`emqx_shared_sub` with the current ones, and activate them in the same way as below.
+
 The patch replaces three modules:
 
 | Module | Change |
 | --- | --- |
-| `emqx_shared_sub` | Dispatch skips a member on a node that the router helper marks down or left. |
-| `emqx_router_helper` | Every node also looks for nodes that are not running but still own shared subscription members, and marks them down. Core nodes purge them. |
+| `emqx_shared_sub` | Dispatch skips a member on a node that the router helper marks down or left. A node writes its own members back when they are missing from the cluster. |
+| `emqx_router_helper` | Every node also looks for nodes that are not running but still own shared subscription members, and marks them down. Core nodes purge them. At each scan, a node also checks its own members. |
 | `emqx_router_sup` | Starts the router helper with both routing schemas, and adds `ensure_helper/0`, which starts it on a running node. |
 
 The same change ships in a normal release through
-[emqx/emqx#20056](https://github.com/emqx/emqx/pull/20056) (6.x) and
-[emqx/emqx#20065](https://github.com/emqx/emqx/pull/20065) (5.10).
+[emqx/emqx#20056](https://github.com/emqx/emqx/pull/20056) and
+[emqx/emqx#20119](https://github.com/emqx/emqx/pull/20119) (6.x), and through
+[emqx/emqx#20065](https://github.com/emqx/emqx/pull/20065) and
+[emqx/emqx#20120](https://github.com/emqx/emqx/pull/20120) (5.10).
 
 ## Which files to take
 
@@ -88,8 +100,8 @@ Expect a pid for the router helper, and these values, in this order:
 
 | Lines | `emqx_router_helper` | `emqx_router_sup` | `emqx_shared_sub` |
 | --- | --- | --- | --- |
-| 5.10, 6.0 | `97304F6BA819F5AA4EA3C144C9251C9C` | `321522781030C3FC1841847C0658AC32` | `5A001C50BAEA6244369F758E41E2565F` |
-| 6.1, 6.2, 6.3 | `402B7F4E7F036EAB5BC333D148B3E4B6` | `939198EA75044AC0E05A4AA79BCF14E2` | `47CB34BB84C4E4FCC9BD9AA450A8E167` |
+| 5.10, 6.0 | `5BA325E6FDE6B03C521CF3841DD648FC` | `321522781030C3FC1841847C0658AC32` | `3A8E456FD3728BE5E4882C1E886848E9` |
+| 6.1, 6.2, 6.3 | `C5A788463483BEACFC34CB64E82284BA` | `939198EA75044AC0E05A4AA79BCF14E2` | `B306BD3F90E3C2EFE0FECF10FBACA8B8` |
 
 These are the checksums of the compiled code, which `module_info(md5)` reports. They are not the
 SHA-256 checksums of the files.
@@ -101,6 +113,10 @@ SHA-256 checksums of the files.
   node that was already down when the helper started, as on a node that was just patched, it
   happens at the first scan, about 10 seconds after the helper starts. The helper scans again about
   every 2 minutes.
+- A node writes its own members back when they are missing from the cluster. It checks at each
+  scan of its router helper: about every 2 minutes, and about 10 seconds after the cluster
+  membership stops changing, as after a partition heals. It then logs
+  `shared_subscription_reregistered` at warning level, with the number of members.
 - A core node purges the members of a replicant that has been down for 15 minutes. Members found
   by the periodic scan (about every 2 minutes) are purged 15 minutes after they are found.
 - The members of a node that left the cluster are purged within about 15 seconds.
@@ -134,18 +150,20 @@ subscription group on each node with `mqttx`, and kills the replicant. On the un
 checks that the member of the dead replicant stays and that half of the messages to the group are
 lost. It then copies the modules into the core node, loads them with the command above, and checks
 that the modules are loaded, that the router helper marks the replicant down, that no message is
-lost, and that a purge removes its member.
+lost, and that a purge removes its member. Last, it removes the member of the live core node from
+the shared subscription table, and checks that the node writes it back and that no message is lost
+after that.
 
 The script triggers the purge with `emqx_router_helper:schedule_force_purge()` instead of waiting
 15 minutes. Set `WAIT_PURGE=1` to wait for the periodic purge.
 
-The script passed on every affected version listed above. On 6.3.3 it also passed with `WAIT_PURGE=1`.
+The script passed on every affected version listed above.
 
 ## How these files were built
 
 The source of the three modules is the same in every affected version, and so is the source after
 the fix on all lines. The modules were built from the fix commit
-[`9f416f2567`](https://github.com/emqx/emqx/commit/9f416f256752d6ed05dfc3298ce2b2d694df9466),
+[`91c8a4a8a2`](https://github.com/emqx/emqx/commit/91c8a4a8a285ae510942a5fbc1b64f5f789660c0),
 with the header files of the latest release of each line (5.10.5, 6.0.4, 6.1.5, 6.2.3, 6.3.3), the
 snabbkaffe header file that release ships, and the compiler options of the EMQX release build:
 

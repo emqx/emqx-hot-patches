@@ -20,13 +20,15 @@
 ##   3. the patched modules are loaded from the patches directory;
 ##   4. the router helper finds the dead node and marks it down;
 ##   5. no message is lost;
-##   6. a purge removes the member.
+##   6. a purge removes the member;
+##   7. the live core node writes its own member back after it is removed from the
+##      shared subscription table (up to about 2.5 minutes).
 
 set -euo pipefail
 
 VSN="${1:-}"
 if [ -z "$VSN" ]; then
-    sed -n '2,24p' "$0" | sed 's/^## \{0,1\}//'
+    sed -n '2,26p' "$0" | sed 's/^## \{0,1\}//'
     exit 2
 fi
 VSN="${VSN#e}"
@@ -110,6 +112,10 @@ has_stale_member() {
 }
 
 no_stale_member() { ! has_stale_member; }
+
+has_core_member() {
+    is_true "lists:member('$CORE_NODE', [node(P) || {_, _, _, P} <- ets:tab2list(emqx_shared_subscription)])."
+}
 
 cat >"$WORK/compose.yaml" <<EOF
 x-emqx: &emqx
@@ -233,6 +239,26 @@ if wait_for "$PURGE_TIMEOUT" "the purge removes the member" no_stale_member; the
     pass "VERIFIED: the purge removed the member of the dead replicant"
 else
     fail "the member of the dead replicant is still in the shared subscription table"
+fi
+
+log "Removing the member of the live core node from the shared subscription table"
+ev 'emqx_shared_sub:purge_node(node()).' >/dev/null
+if has_core_member; then
+    fail "the member of the core node is still in the shared subscription table"
+else
+    pass "the member of the core node is removed, as when another node deletes it"
+fi
+echo "    Waiting for the next scan of the router helper, up to 3 minutes"
+if wait_for 180 "the core node writes its member back" has_core_member; then
+    pass "VERIFIED: the core node wrote its member back"
+else
+    fail "the core node did not write its member back"
+fi
+N="$(publish_10)"
+if [ "$N" -eq 10 ]; then
+    pass "VERIFIED: 10 of 10 messages reached the live member"
+else
+    fail "$N of 10 messages reached the live member"
 fi
 
 if [ "$FAILED" = "0" ]; then
