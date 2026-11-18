@@ -101,22 +101,6 @@ emqx eval '{binary:encode_hex(httpc:module_info(md5)), code:which(httpc)}.'
 
 Expect the patched code MD5 of your line and a path ending in `patches/httpc.beam`.
 
-To see the leak itself, this measures how much a fresh process grows after 10,000 asynchronous
-requests to a closed local port (it takes a few seconds):
-
-```sh
-emqx eval 'Ref = element(2, spawn_monitor(fun() ->
-    erlang:garbage_collect(), {memory, M0} = process_info(self(), memory),
-    [{ok, _} = httpc:request(get, {"http://127.0.0.1:1/", []}, [], [{sync, false}])
-     || _ <- lists:seq(1, 10000)],
-    Drain = fun D() -> receive {http, _} -> D() after 2000 -> ok end end, Drain(),
-    erlang:garbage_collect(), {memory, M1} = process_info(self(), memory),
-    exit({growth, M1 - M0}) end)),
-  receive {'"'"'DOWN'"'"', Ref, _, _, {growth, G}} -> G end.'
-```
-
-The result is in bytes. Unpatched, expect about 1,000,000; patched, below 100.
-
 ## Remove before upgrading
 
 Remove `httpc.beam` from the patches directory, and any deployment step that copies it there,
@@ -132,7 +116,9 @@ Building the unpatched source the same way reproduces the original code MD5 of e
 The `httpc.erl` source and the compiler are identical across every emqx/otp build of these
 Erlang/OTP lines, so all releases listed above ship the same original module.
 
-Each file was tested on the latest official image of its line, with the commands in this README:
+Each file was tested on the latest official image of its line, with the hot apply command in this
+README. Growth is how much a fresh process grows after 10,000 asynchronous requests to a closed
+local port:
 
 | Image | Original MD5 matched | Growth before (bytes per 10,000 async requests) | Growth after hot apply (bytes per 10,000 async requests) | After restart, loaded from `patches` |
 | --- | --- | --- | --- | --- |
@@ -144,7 +130,7 @@ Each file was tested on the latest official image of its line, with the commands
 | `emqx/emqx-enterprise:6.2.3` | yes | 1,120,016 | 16 | yes |
 | `emqx/emqx-enterprise:6.3.3` | yes | 1,120,016 | 16 | yes |
 
-One run per image. Growth is measured on a fresh process after garbage collection. A synchronous
+One run per image, measured after garbage collection. A synchronous
 request returned normally after the load on every image. On standalone Erlang/OTP nodes, a
 synchronous request that was waiting during the load completed normally.
 
