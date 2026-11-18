@@ -18,7 +18,8 @@ refresh. Other `httpc` callers (CRL and OCSP caches, the Prometheus push gateway
 only when a request fails early.
 
 The patch stops new leaks. **It does not free memory already leaked**; that memory stays with the
-process that holds it until the process exits. A node restart releases it.
+process that holds it until the process exits. A node restart releases it; for JWKS, see
+[Release memory already leaked by JWKS clients](#release-memory-already-leaked-by-jwks-clients).
 
 ## Compatibility and checksum
 
@@ -101,6 +102,25 @@ emqx eval '{binary:encode_hex(httpc:module_info(md5)), code:which(httpc)}.'
 
 Expect the patched code MD5 of your line and a path ending in `patches/httpc.beam`.
 
+## Release memory already leaked by JWKS clients
+
+The JWKS requests come from a pool of `emqx_authn_jwks_client` processes, `pool_size` (default 8)
+per JWT authenticator that uses a JWKS endpoint. To free what they already leaked without
+restarting the node, restart the authenticator's resource **after** the patch is loaded; the pool
+is replaced by new processes:
+
+```sh
+emqx eval '[{R, emqx_resource:restart(R)} || R <- emqx_resource:list_instances(), binary:match(R, <<"jwt">>) =/= nomatch].'
+```
+
+Expect `ok` for each resource, for example `[{<<"authn:jwt:9">>,ok}]`. The command selects
+resources whose ID contains `jwt`; run `emqx eval 'emqx_resource:list_instances().'` first to see
+what it will restart. Run it on every node.
+
+While the pool restarts, JWT logins that need the key set cannot be verified for a moment. Do not
+kill the client processes instead: the pool does not replace them, and the authenticator is left
+with fewer workers.
+
 ## Remove before upgrading
 
 Remove `httpc.beam` from the patches directory, and any deployment step that copies it there,
@@ -133,6 +153,12 @@ local port:
 One run per image, measured after garbage collection. A synchronous
 request returned normally after the load on every image. On standalone Erlang/OTP nodes, a
 synchronous request that was waiting during the load completed normally.
+
+The JWKS release command was tested on the 5.8.11, 5.10.5 and 6.3.3 images with a JWT authenticator
+using a local JWKS endpoint. After 2,000 forced refreshes per client, the total memory of the 8
+clients grew from about 110,000 to 1,583,040 bytes (5.8.11) and 1,839,104 bytes (5.10.5, 6.3.3);
+after the command it was back at the level of a new pool, and the resource reported healthy and
+returned the key set. One run per image.
 
 The permanent fix for Erlang/OTP 26 is [emqx/otp#133](https://github.com/emqx/otp/pull/133); the
 same change follows for the Erlang/OTP 27 and 28 lines.
