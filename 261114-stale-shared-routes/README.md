@@ -100,8 +100,8 @@ Expect a pid for the router helper, and these values, in this order:
 
 | Lines | `emqx_router_helper` | `emqx_router_sup` | `emqx_shared_sub` |
 | --- | --- | --- | --- |
-| 5.10, 6.0 | `5BA325E6FDE6B03C521CF3841DD648FC` | `321522781030C3FC1841847C0658AC32` | `7FD84F49A92F35FC0F0824589A76D426` |
-| 6.1, 6.2, 6.3 | `C5A788463483BEACFC34CB64E82284BA` | `939198EA75044AC0E05A4AA79BCF14E2` | `EC28354B97476D86CA4F2E4B1871780A` |
+| 5.10, 6.0 | `5BA325E6FDE6B03C521CF3841DD648FC` | `321522781030C3FC1841847C0658AC32` | `7D7BB81C8BD9C373C50678F406CBCBA4` |
+| 6.1, 6.2, 6.3 | `C5A788463483BEACFC34CB64E82284BA` | `939198EA75044AC0E05A4AA79BCF14E2` | `8C9680D2EF755591770DAEC1571DBBF6` |
 
 These are the checksums of the compiled code, which `module_info(md5)` reports. They are not the
 SHA-256 checksums of the files.
@@ -163,7 +163,7 @@ The script passed on every affected version listed above.
 
 The source of the three modules is the same in every affected version, and so is the source after
 the fix on all lines. The modules were built from the fix commit
-[`8eabe98a3e`](https://github.com/emqx/emqx/commit/8eabe98a3e98a91f46e37b1a5cdacc660903ebef),
+[`38ecfc362a`](https://github.com/emqx/emqx/commit/38ecfc362ac727f8b4309b03d5c307dd31cc44c9),
 with the header files of the latest release of each line (5.10.5, 6.0.4, 6.1.5, 6.2.3, 6.3.3), the
 snabbkaffe header file that release ships, and the compiler options of the EMQX release build:
 
