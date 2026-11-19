@@ -1,0 +1,36 @@
+# Merge these additions into the existing workload's Pod template.
+# This is not a standalone manifest. Preserve existing containers and volumes.
+# The existing volume named "data" must also back the EMQX data directory.
+# Match its actual name, any subPath, and the EMQX user's UID/GID.
+# Match the init image to the node's EMQX version: 6.3.0, 6.3.1, or 6.3.2.
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: wolff-noack-patch
+          image: emqx/emqx-enterprise:6.3.2
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              cd /hotpatch
+              sha256sum -c wolff_producer.beam.sha256
+              mkdir -p /emqx-data/patches
+              cp wolff_producer.beam /emqx-data/patches/
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: wolff-noack-patch
+              mountPath: /hotpatch
+              readOnly: true
+            - name: data
+              mountPath: /emqx-data
+      volumes:
+        - name: wolff-noack-patch
+          configMap:
+            name: wolff-noack-6-3-0-6-3-2-v1
+            defaultMode: 0444
