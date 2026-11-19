@@ -1,0 +1,1637 @@
+diff --git a/apps/emqx/src/emqx_ds_shared_sub/emqx_ds_shared_sub_dl.erl b/apps/emqx/src/emqx_ds_shared_sub/emqx_ds_shared_sub_dl.erl
+index 5744de7408..656797d1c0 100644
+--- a/apps/emqx/src/emqx_ds_shared_sub/emqx_ds_shared_sub_dl.erl
++++ b/apps/emqx/src/emqx_ds_shared_sub/emqx_ds_shared_sub_dl.erl
+@@ -51,7 +51,7 @@ This module abstracts all CRUD operations on the shared sub leader durable state
+ ]).
+
+ %% behavior callbacks:
+--export([pmap_encode_key/3, pmap_decode_key/2, pmap_encode_val/3, pmap_decode_val/3]).
++-export([pmap_encode_key/2, pmap_decode_key/2, pmap_encode_val/3, pmap_decode_val/3]).
+
+ %% internal exports:
+ -export([]).
+@@ -350,11 +350,11 @@ iterator_next(Cursor, Limit) ->
+ %% behavior callbacks
+ %%================================================================================
+
+-pmap_encode_key(?top_properties, Key, _Val) ->
++pmap_encode_key(?top_properties, Key) ->
+     Key;
+-pmap_encode_key(?top_generations, Key, _Val) ->
++pmap_encode_key(?top_generations, Key) ->
+     Key;
+-pmap_encode_key(?top_iterators, Key, _Val) ->
++pmap_encode_key(?top_iterators, Key) ->
+     {{Shard, Gen}, Stream} = Key,
+     {ok, StreamBin} = emqx_ds:stream_to_binary(messages, Stream),
+     'DSSharedSub':encode('StreamId', #'StreamId'{
+@@ -362,7 +362,7 @@ pmap_encode_key(?top_iterators, Key, _Val) ->
+         generation = Gen,
+         stream = StreamBin
+     });
+-pmap_encode_key(_, Key, _Val) ->
++pmap_encode_key(_, Key) ->
+     term_to_binary(Key).
+
+ pmap_decode_key(?top_properties, Key) ->
+diff --git a/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state.erl b/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state.erl
+index 8e289c117c..f68facc546 100644
+--- a/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state.erl
++++ b/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state.erl
+@@ -218,8 +218,8 @@ print_channel(SessionId) ->
+ format(Rec) ->
+     lists:foldl(
+         fun(K, Acc) ->
+-            #{K := #pmap{cache = Val}} = Rec,
+-            Acc#{K := Val}
++            #{K := Pmap} = Rec,
++            Acc#{K := emqx_ds_pmap:to_map(Pmap)}
+         end,
+         Rec,
+         ?sessds_pmaps
+diff --git a/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state_v2.erl b/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state_v2.erl
+index 013766294c..2bc4eab85f 100644
+--- a/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state_v2.erl
++++ b/apps/emqx/src/emqx_persistent_session_ds/emqx_persistent_session_ds_state_v2.erl
+@@ -52,7 +52,7 @@
+ ]).
+
+ %% Behavior callbacks:
+--export([pmap_encode_key/3, pmap_decode_key/2, pmap_encode_val/3, pmap_decode_val/3]).
++-export([pmap_encode_key/2, pmap_decode_key/2, pmap_encode_val/3, pmap_decode_val/3]).
+
+ -export_type([session_iterator/0, subscription_iterator/0]).
+
+@@ -72,7 +72,7 @@
+ %% TODO: https://github.com/erlang/otp/issues/9841
+ -dialyzer(
+     {nowarn_function, [
+-        pmap_encode_key/3,
++        pmap_encode_key/2,
+         pmap_decode_key/2,
+         ser_stream_key/1,
+         deser_stream_key/1,
+@@ -476,6 +476,9 @@ open_tx(ClientId, MaybeOldGuard) ->
+         OldGuard when is_binary(OldGuard) ->
+             emqx_ds_pmap:tx_assert_guard(ClientId, OldGuard)
+     end,
++    RestorePmap = fun(PMap) ->
++        emqx_ds_pmap:tx_restore(?MODULE, pmap_name(PMap), ClientId, pmap_kind(PMap))
++    end,
+     case emqx_ds_pmap:tx_guard(ClientId) of
+         undefined ->
+             undefined;
+@@ -487,15 +490,13 @@ open_tx(ClientId, MaybeOldGuard) ->
+                 ?checkpoint_n => 0,
+                 ?checkpoint_ref => undefined,
+                 ?invalid => false,
+-                ?metadata => emqx_ds_pmap:tx_restore(?MODULE, ?top_metadata, ClientId),
+-                ?subscriptions => emqx_ds_pmap:tx_restore(?MODULE, ?top_subscriptions, ClientId),
+-                ?subscription_states => emqx_ds_pmap:tx_restore(
+-                    ?MODULE, ?top_subscription_states, ClientId
+-                ),
+-                ?seqnos => emqx_ds_pmap:tx_restore(?MODULE, ?top_seqnos, ClientId),
+-                ?streams => emqx_ds_pmap:tx_restore(?MODULE, ?top_streams, ClientId),
+-                ?ranks => emqx_ds_pmap:tx_restore(?MODULE, ?top_ranks, ClientId),
+-                ?awaiting_rel => emqx_ds_pmap:tx_restore(?MODULE, ?top_awaiting_rel, ClientId),
++                ?metadata => RestorePmap(?metadata),
++                ?subscriptions => RestorePmap(?subscriptions),
++                ?subscription_states => RestorePmap(?subscription_states),
++                ?seqnos => RestorePmap(?seqnos),
++                ?streams => RestorePmap(?streams),
++                ?ranks => RestorePmap(?ranks),
++                ?awaiting_rel => RestorePmap(?awaiting_rel),
+                 ?new_pmap_collection
+             },
+             {ok, Ret}
+@@ -503,18 +504,18 @@ open_tx(ClientId, MaybeOldGuard) ->
+
+ -spec new_pmap(atom()) -> emqx_ds_pmap:pmap(_, _).
+ new_pmap(Pmap) ->
+-    emqx_ds_pmap:new_pmap(?MODULE, pmap_name(Pmap)).
++    emqx_ds_pmap:new_pmap(?MODULE, pmap_name(Pmap), pmap_kind(Pmap)).
+
+-pmap_encode_key(?top_metadata, MetaKey, _Val) ->
++pmap_encode_key(?top_metadata, MetaKey) ->
+     atom_to_binary(MetaKey, latin1);
+-pmap_encode_key(?top_streams, Key, _Val) ->
++pmap_encode_key(?top_streams, Key) ->
+     ser_stream_key(Key);
+-pmap_encode_key(?top_subscriptions, Topic, _Val) ->
++pmap_encode_key(?top_subscriptions, Topic) ->
+     'DurableSession':encode('TopicFilter', wrap_topic(Topic));
+-pmap_encode_key(?top_seqnos, Track, _Val) ->
++pmap_encode_key(?top_seqnos, Track) ->
+     ?assert(Track < 255),
+     <<Track:8>>;
+-pmap_encode_key(_, Key, _Val) ->
++pmap_encode_key(_, Key) ->
+     term_to_binary(Key).
+
+ pmap_decode_key(?top_metadata, Key) ->
+@@ -842,3 +843,6 @@ pmap_name(Pmap) ->
+         ?ranks -> ?top_ranks;
+         ?awaiting_rel -> ?top_awaiting_rel
+     end.
++
++pmap_kind(_Pmap) ->
++    dirty.
+diff --git a/apps/emqx/test/emqx_persistent_session_ds_state_fuzzer.erl b/apps/emqx/test/emqx_persistent_session_ds_state_fuzzer.erl
+index 0a7fa0038d..7520b5b321 100644
+--- a/apps/emqx/test/emqx_persistent_session_ds_state_fuzzer.erl
++++ b/apps/emqx/test/emqx_persistent_session_ds_state_fuzzer.erl
+@@ -430,13 +430,13 @@ postcondition(#gs{ds_broken = false}, {call, ?MODULE, commit, [SessionId | _]},
+     %% Verify that dirty state of all pmaps is cleaned by a successful commit:
+     lists:foreach(
+         fun(I) ->
+-            #{I := #pmap{dirty = Dirty}} = Memory,
+-            ?assertEqual(
+-                #{},
+-                Dirty,
++            #{I := Pmap} = Memory,
++            ?assertNot(
++                emqx_ds_pmap:is_dirty(Pmap),
+                 #{
+                     field => I,
+-                    session => SessionId
++                    session => SessionId,
++                    pmap => Pmap
+                 }
+             )
+         end,
+diff --git a/apps/emqx_ds_backends/test/emqx_ds_backends_SUITE.erl b/apps/emqx_ds_backends/test/emqx_ds_backends_SUITE.erl
+index f1c86905cd..86992bab52 100644
+--- a/apps/emqx_ds_backends/test/emqx_ds_backends_SUITE.erl
++++ b/apps/emqx_ds_backends/test/emqx_ds_backends_SUITE.erl
+@@ -2404,6 +2404,136 @@ t_30_quotas(Config) ->
+         []
+     ).
+
++%% This testcase verifies the semantics of the explicit dirty marks
++%% (`emqx_ds:tx_mark_dirty/4`). The mark doesn't modify the data and
++%% doesn't conflict-check its own transaction: it only collapses the
++%% conflict tracking of the region into a single wildcard entry, so
++%% the individual keys that the transaction wrote or deleted don't
++%% appear in the conflict trees, while the transactions that read the
++%% region are still aborted.
++t_31_tx_mark_dirty(Config) ->
++    DB = ?FUNCTION_NAME,
++    Opts = opts(Config),
++    TXOpts = #{shard => {auto, <<"me">>}, generation => 1, timeout => infinity},
++    %% Record that should not be present in the DB:
++    Canary = [{[<<"canary">>], 0, <<>>}],
++    CheckCanary = fun() ->
++        ?assertMatch([], emqx_ds:dirty_read(DB, [<<"canary">>]))
++    end,
++    %% Helper function that create a pair of transactions
++    %% (simultaneously), commits the first one, and then tries to
++    %% commit the second one.
++    Par = fun(Ops1, Ops2) ->
++        %% 1. Create context for two transactions:
++        {ok, Tx1} = emqx_ds:new_tx(DB, TXOpts),
++        {ok, Tx2} = emqx_ds:new_tx(DB, TXOpts),
++        %% 2. Commit the first one:
++        ?assertMatch(
++            {ok, _},
++            do_commit_tx(DB, Tx1, Ops1)
++        ),
++        %% 3. Try to commit the second one and return the result:
++        do_commit_tx(DB, Tx2, Ops2)
++    end,
++    %% Wrappers:
++    Ok = fun(Ops1, Ops2) ->
++        ?assertMatch({ok, _}, Par(Ops1, Ops2))
++    end,
++    Conflict = fun(Ops1, Ops2) ->
++        ?assertMatch(
++            ?err_rec({read_conflict, _}),
++            Par(
++                Ops1,
++                Ops2#{?ds_tx_write => Canary}
++            )
++        ),
++        CheckCanary()
++    end,
++    %% Dirty marks of both kinds over an entire pmap-like topic filter:
++    MarkTF = [<<"l">>, <<"t">>, '+'],
++    WMark = fun() -> #{?ds_tx_wmark => [{MarkTF, 0, infinity}]} end,
++    DMark = fun() -> #{?ds_tx_dmark => [{MarkTF, 0, infinity}]} end,
++    %% Dump the conflict tree of the shard and return its entries:
++    Entries = fun(Kind) ->
++        Shard = emqx_ds:shard_of(DB, <<"me">>),
++        case emqx_ds_optimistic_tx:dump_conflicts(DB, Shard, 1, Kind) of
++            #{old := Old, current := Current} -> maps:from_list(Old ++ Current);
++            undefined -> #{}
++        end
++    end,
++    ?check_trace(
++        begin
++            ?assertMatch(ok, emqx_ds_open_db(DB, Opts)),
++            %% 1. Commit a transaction that writes and deletes several
++            %% keys under a common topic filter, and marks the filter
++            %% dirty:
++            {ok, Tx1} = emqx_ds:new_tx(DB, TXOpts),
++            ?assertMatch(
++                {ok, _},
++                do_commit_tx(
++                    DB,
++                    Tx1,
++                    #{
++                        ?ds_tx_write => [
++                            {[<<"l">>, <<"t">>, <<1>>], 0, <<1>>},
++                            {[<<"l">>, <<"t">>, <<2>>], 0, <<2>>},
++                            %% Control: a key outside of the marked filter:
++                            {[<<"x">>, <<1>>], 0, <<1>>}
++                        ],
++                        ?ds_tx_delete_topic => [
++                            {[<<"l">>, <<"t">>, <<3>>], 0, infinity}
++                        ],
++                        ?ds_tx_wmark => [{MarkTF, 0, infinity}],
++                        ?ds_tx_dmark => [{MarkTF, 0, infinity}]
++                    }
++                )
++            ),
++            %% The written and the deleted keys must not appear in the
++            %% conflict trees: the marks collapsed the entire region
++            %% into a single wildcard entry covering the whole time
++            %% range:
++            W = Entries(w),
++            ?assertEqual(
++                [[<<"l">>, <<"t">>, '#']],
++                [K || K <- maps:keys(W), lists:prefix([<<"l">>, <<"t">>], K)]
++            ),
++            ?assertMatch({0, infinity, _}, maps:get([<<"l">>, <<"t">>, '#'], W)),
++            D = Entries(d),
++            ?assertEqual(
++                [[<<"l">>, <<"t">>, '#']],
++                [K || K <- maps:keys(D), lists:prefix([<<"l">>, <<"t">>], K)]
++            ),
++            ?assertMatch({0, infinity, _}, maps:get([<<"l">>, <<"t">>, '#'], D)),
++            %% The keys outside of the marked filter are still tracked
++            %% individually:
++            ?assert(maps:is_key([<<"x">>, <<1>>], W)),
++            %% 2. The marked region still conflicts with the
++            %% concurrent reads, which is what protects the
++            %% read-modify-write cycles of the pmap collections:
++            Conflict(WMark(), #{?ds_tx_read => [{MarkTF, 0, infinity}]}),
++            Conflict(DMark(), #{?ds_tx_read => [{MarkTF, 0, infinity}]}),
++            %% 3. The mark doesn't conflict-check its own transaction:
++            %% a concurrent write into the marked range doesn't abort
++            %% the marking transaction:
++            Ok(
++                #{?ds_tx_write => [{[<<"l">>, <<"t">>, <<9>>], 0, <<>>}]},
++                WMark()
++            ),
++            %% 4. The mark doesn't abort the writers either: a
++            %% transaction that only writes into the marked range
++            %% succeeds and wins by its commit serial:
++            Ok(
++                WMark(),
++                #{?ds_tx_write => [{[<<"l">>, <<"t">>, <<42>>], 0, <<42>>}]}
++            ),
++            ?assertMatch(
++                [{[<<"l">>, <<"t">>, <<42>>], 0, <<42>>}],
++                emqx_ds:dirty_read(DB, [<<"l">>, <<"t">>, <<42>>])
++            )
++        end,
++        []
++    ).
++
+ t_db_group_crud(Config) ->
+     %% This testcase uses the default implicit group created by DS:
+     DB = ?FUNCTION_NAME,
+diff --git a/apps/emqx_durable_storage/include/emqx_ds.hrl b/apps/emqx_durable_storage/include/emqx_ds.hrl
+index 8b496c295b..a2c0f10594 100644
+--- a/apps/emqx_durable_storage/include/emqx_ds.hrl
++++ b/apps/emqx_durable_storage/include/emqx_ds.hrl
+@@ -65,6 +65,8 @@
+ -define(ds_tx_read, r).
+ -define(ds_tx_expected, e).
+ -define(ds_tx_unexpected, u).
++-define(ds_tx_wmark, mw).
++-define(ds_tx_dmark, md).
+
+ %% Client
+ -record(emqx_ds_client_retry, {ref :: reference()}).
+diff --git a/apps/emqx_durable_storage/include/emqx_ds_pmap.hrl b/apps/emqx_durable_storage/include/emqx_ds_pmap.hrl
+index e8966a3cfd..ac0f9fbfdd 100644
+--- a/apps/emqx_durable_storage/include/emqx_ds_pmap.hrl
++++ b/apps/emqx_durable_storage/include/emqx_ds_pmap.hrl
+@@ -4,6 +4,14 @@
+ -ifndef(EMQX_DS_PMAP_HRL).
+ -define(EMQX_DS_PMAP_HRL, true).
+
++%% Dirty marker for #pmap
++-record(pmap_dirty, {
++    up_ctr,
++    comm_ctr,
++    was,
++    live
++}).
++
+ %% Persistent map.
+ %%
+ %% Pmap accumulates the updates in a term stored in the heap of a
+@@ -28,6 +36,16 @@
+     tx_counter = 0
+ }).
+
++%% A pmap that serves as a set. It can only store atom `true'. Its
++%% at-rest representation is the same as pmap, so the implementations
++%% are interchangable.
++-record(pset, {
++    name,
++    module,
++    data = #{},
++    size = 0
++}).
++
+ -define(top_data, <<"d">>).
+ -define(top_guard, <<"g">>).
+
+diff --git a/apps/emqx_durable_storage/src/emqx_ds.erl b/apps/emqx_durable_storage/src/emqx_ds.erl
+index d228f1b761..46ce01b9c0 100644
+--- a/apps/emqx_durable_storage/src/emqx_ds.erl
++++ b/apps/emqx_durable_storage/src/emqx_ds.erl
+@@ -77,6 +77,7 @@ It takes care of forwarding calls to the underlying DBMS.
+     tx_del_topic/1,
+     tx_ttv_assert_present/3,
+     tx_ttv_assert_absent/2,
++    tx_mark_dirty/4,
+     tx_on_success/1
+ ]).
+
+@@ -410,7 +411,10 @@ Options for the `subscribe` API.
+     %%   List of objects that should be present in the database.
+     ?ds_tx_expected => [{topic(), time(), binary() | '_'}],
+     %%   List of objects that should NOT be present in the database.
+-    ?ds_tx_unexpected => [{topic(), time()}]
++    ?ds_tx_unexpected => [{topic(), time()}],
++    %% Explicit dirty marks (see `tx_mark_dirty/4`):
++    ?ds_tx_wmark => [topic_range()],
++    ?ds_tx_dmark => [topic_range()]
+ }.
+
+ -doc "Options for `trans/2` function.".
+@@ -1439,6 +1443,8 @@ tx_commit_outcome(DB, Ref, ?ds_tx_commit_reply(Ref, Reply)) ->
+ -define(tx_ops_del_topic, emqx_ds_tx_ctx_del_topic).
+ -define(tx_ops_assert_present, emqx_ds_tx_ctx_assert_present).
+ -define(tx_ops_assert_absent, emqx_ds_tx_ctx_assert_absent).
++-define(tx_ops_wmark, emqx_ds_tx_ctx_wmark).
++-define(tx_ops_dmark, emqx_ds_tx_ctx_dmark).
+ -define(tx_ops_side_effect, emqx_ds_tx_ctx_side_effect).
+
+ %% Transaction throws:
+@@ -1628,6 +1634,41 @@ tx_write({Topic, Time, Value}) ->
+             error(badarg)
+     end.
+
++-doc """
++
++Mark the region of the storage matching the topic filter and the time range as dirty,
++without writing or deleting anything.
++
++The mark affects only the conflict tracking of the optimistic transaction manager:
++the marked region is tracked as a single unit,
++so the transactions that READ or verify preconditions
++on the overlapping range after this transaction commits are aborted,
++as they would be if the individual keys were updated.
++The transaction that creates the mark is not conflict-checked against the region,
++and a transaction that only WRITES into the region
++is not aborted by the marks of the other transactions:
++concurrent writers are ordered by their commit serials.
++
++In builtin backends this function can be used to optimize memory usage:
++if a transaction updates multiple keys matching a common topic filter,
++it may be wise to mark the entire topic filter as dirty
++to avoid tracking conflicts for the individual keys.
++
++""".
++-doc #{title => <<"Transactions">>, since => <<"6.0.5">>}.
++-spec tx_mark_dirty(topic_filter(), time(), time() | ?ds_tx_ts_monotonic | infinity, w | d) -> ok.
++tx_mark_dirty(TopicFilter, From, To, Kind) ->
++    case is_topic_filter(TopicFilter) of
++        true when ?is_time_range(From, To) ->
++            case Kind of
++                w -> tx_push_op(?tx_ops_wmark, {TopicFilter, From, To});
++                d -> tx_push_op(?tx_ops_dmark, {TopicFilter, From, To});
++                _ -> error({badkind, Kind})
++            end;
++        _ ->
++            error(badarg)
++    end.
++
+ -doc "Equivalent to `tx_del_topic(TopicFilter, 0, infinity)`.".
+ -doc #{title => <<"Transactions">>, since => <<"5.10.0">>}.
+ -spec tx_del_topic(topic_filter()) -> ok.
+@@ -1650,7 +1691,7 @@ tx_del_topic(TopicFilter, From, To) ->
+     case is_topic_filter(TopicFilter) of
+         true when ?is_time_range(From, To) ->
+             tx_push_op(?tx_ops_del_topic, {TopicFilter, From, To});
+-        false ->
++        _ ->
+             error(badarg)
+     end.
+
+@@ -2322,6 +2363,8 @@ trans_inner(DB, Fun, Opts) ->
+                 _ = put(?tx_ops_del_topic, []),
+                 _ = put(?tx_ops_assert_present, []),
+                 _ = put(?tx_ops_assert_absent, []),
++                _ = put(?tx_ops_wmark, []),
++                _ = put(?tx_ops_dmark, []),
+                 _ = put(?tx_ops_side_effect, []),
+                 Ret = Fun(),
+                 Tx = #{
+@@ -2329,7 +2372,9 @@ trans_inner(DB, Fun, Opts) ->
+                     ?ds_tx_read => erase(?tx_ops_read),
+                     ?ds_tx_delete_topic => erase(?tx_ops_del_topic),
+                     ?ds_tx_expected => erase(?tx_ops_assert_present),
+-                    ?ds_tx_unexpected => erase(?tx_ops_assert_absent)
++                    ?ds_tx_unexpected => erase(?tx_ops_assert_absent),
++                    ?ds_tx_wmark => erase(?tx_ops_wmark),
++                    ?ds_tx_dmark => erase(?tx_ops_dmark)
+                 },
+                 case Tx of
+                     #{
+@@ -2337,9 +2382,11 @@ trans_inner(DB, Fun, Opts) ->
+                         ?ds_tx_read := [],
+                         ?ds_tx_delete_topic := [],
+                         ?ds_tx_expected := [],
+-                        ?ds_tx_unexpected := []
++                        ?ds_tx_unexpected := [],
++                        ?ds_tx_wmark := [],
++                        ?ds_tx_dmark := []
+                     } ->
+-                        %% Nothing to commit, apply side effects now:
++                        %% Nothing to commit. Apply side effects now:
+                         tx_eval_side_effects(erase(?tx_ops_side_effect)),
+                         {nop, Ret};
+                     _ ->
+@@ -2362,6 +2409,8 @@ trans_inner(DB, Fun, Opts) ->
+         _ = erase(?tx_ops_del_topic),
+         _ = erase(?tx_ops_assert_present),
+         _ = erase(?tx_ops_assert_absent),
++        _ = erase(?tx_ops_wmark),
++        _ = erase(?tx_ops_dmark),
+         _ = erase(?tx_ops_side_effect)
+     end.
+
+diff --git a/apps/emqx_durable_storage/src/emqx_ds_optimistic_tx.erl b/apps/emqx_durable_storage/src/emqx_ds_optimistic_tx.erl
+index ba81a85301..84178ed2a9 100644
+--- a/apps/emqx_durable_storage/src/emqx_ds_optimistic_tx.erl
++++ b/apps/emqx_durable_storage/src/emqx_ds_optimistic_tx.erl
+@@ -52,6 +52,12 @@ backend can reject flush request.
+     loop/1
+ ]).
+
++%% Debugging (dangerous!)
++-export([
++    conflict_stats/2,
++    dump_conflicts/4
++]).
++
+ %% System exports
+ -export([
+     system_continue/3,
+@@ -239,6 +245,8 @@ backend can reject flush request.
+ -type del_batch() :: #ds_del_batch{}.
+
+ -record(call_add_generation, {}).
++-record(call_conflict_stats, {}).
++-record(call_dump_conflicts, {gen :: emqx_ds:generation(), kind :: w | d}).
+
+ %%================================================================================
+ %% API functions
+@@ -441,6 +449,42 @@ get_monotonic_timestamp() ->
+     put(?ds_tx_monotonic_ts, TS),
+     TS.
+
++-doc """
++Get the number of tracked conflicts per generation.
++
++This is an operator helper for interactive debugging: the call blocks
++until the shard's transaction manager replies, and the business code
++must never call it.
++""".
++-spec conflict_stats(emqx_ds:db(), emqx_ds:shard()) ->
++    #{emqx_ds:generation() => #{w := non_neg_integer(), d := non_neg_integer()}}.
++conflict_stats(DB, Shard) ->
++    call(
++        ?via(DB, Shard),
++        #call_conflict_stats{},
++        infinity
++    ).
++
++-doc """
++Dump conflict statistics for all generations.
++
++WARNING: This function may be extremely expensive if the conflict tree is large.
++
++This is an operator helper for interactive debugging: the call blocks
++until the shard's transaction manager replies, and the business code
++must never call it.
++""".
++-spec dump_conflicts(emqx_ds:db(), emqx_ds:shard(), emqx_ds:generation(), w | d) ->
++    list() | undefined.
++dump_conflicts(DB, Shard, Generation, Kind) when
++    is_integer(Generation), Kind =:= d orelse Kind =:= w
++->
++    call(
++        ?via(DB, Shard),
++        #call_dump_conflicts{gen = Generation, kind = Kind},
++        infinity
++    ).
++
+ %%================================================================================
+ %% Internal exports
+ %%================================================================================
+@@ -540,6 +584,12 @@ handle_call(From, #call_add_generation{}, D0) ->
+     {Reply, D} = handle_add_generation(D0),
+     gen:reply(From, Reply),
+     D;
++handle_call(From, #call_dump_conflicts{gen = Gen, kind = Kind}, D) ->
++    gen:reply(From, do_dump_conflicts(Gen, Kind, D)),
++    D;
++handle_call(From, #call_conflict_stats{}, D) ->
++    gen:reply(From, do_conflict_stats(D)),
++    D;
+ handle_call(From, Unknown, D) ->
+     ?tp(warning, emqx_ds_optimistic_tx_unknown_call, #{
+         call => Unknown,
+@@ -672,7 +722,7 @@ handle_del_batch(
+         true ?= is_integer(BatchSize) orelse ?err_unrec(bad_batch_size),
+         true ?= is_boolean(DoItDirty) orelse ?err_unrec(bad_dirty),
+         ok ?= check_olp(OLPMaxMQL),
+-        TopicRange = preprocess_delete(MonotonicTS, TopicRange0),
++        TopicRange = preprocess_topic_range(MonotonicTS, TopicRange0),
+         {ok, _PresumedCommitSerial, D} = with_time_and_generation(
+             Gen,
+             D0,
+@@ -1107,9 +1157,9 @@ check_quota(false, Ops) ->
+
+ -spec update_dirty_d(serial(), emqx_ds:tx_ops(), emqx_ds_tx_conflict_trie:t()) ->
+     emqx_ds_tx_conflict_trie:t().
+-update_dirty_d(Serial, Ops, Dirty) ->
++update_dirty_d(Serial, Ops, Dirty0) ->
+     %% Mark all deleted topics as dirty:
+-    lists:foldl(
++    Dirty = lists:foldl(
+         fun({TF, FromTime, ToTime}, Acc) ->
+             emqx_ds_tx_conflict_trie:push_topic(
+                 emqx_ds_tx_conflict_trie:topic_filter_to_conflict_domain(TF),
+@@ -1119,20 +1169,47 @@ update_dirty_d(Serial, Ops, Dirty) ->
+                 Acc
+             )
+         end,
+-        Dirty,
++        Dirty0,
+         maps:get(?ds_tx_delete_topic, Ops, [])
++    ),
++    %% Add d-marks:
++    mark_tf_ranges_dirty(
++        Serial,
++        Dirty,
++        maps:get(?ds_tx_dmark, Ops, [])
+     ).
+
+ -spec update_dirty_w(serial(), emqx_ds:tx_ops(), emqx_ds_tx_conflict_trie:t()) ->
+     emqx_ds_tx_conflict_trie:t().
+-update_dirty_w(Serial, Ops, Dirty) ->
++update_dirty_w(Serial, Ops, Dirty0) ->
+     %% Mark written topics as dirty:
+-    lists:foldl(
++    Dirty = lists:foldl(
+         fun({TF, TS, _Val}, Acc) ->
+             emqx_ds_tx_conflict_trie:push_topic(TF, TS, TS, Serial, Acc)
+         end,
+-        Dirty,
++        Dirty0,
+         maps:get(?ds_tx_write, Ops, [])
++    ),
++    %% Add w-marks:
++    mark_tf_ranges_dirty(
++        Serial,
++        Dirty,
++        maps:get(?ds_tx_wmark, Ops, [])
++    ).
++
++mark_tf_ranges_dirty(Serial, Dirty, TopicRanges) ->
++    lists:foldl(
++        fun({TF, From, To}, Acc) ->
++            emqx_ds_tx_conflict_trie:push_topic(
++                emqx_ds_tx_conflict_trie:topic_filter_to_conflict_domain(TF),
++                From,
++                To,
++                Serial,
++                Acc
++            )
++        end,
++        Dirty,
++        TopicRanges
+     ).
+
+ -spec do_flush(d()) -> d().
+@@ -1281,19 +1358,23 @@ preprocess_ops(_PresumedCommitSerial, Tx) ->
+     MonotonicTS = get_monotonic_timestamp(),
+     maps:map(
+         fun
+-            (?ds_tx_delete_topic, Ops) ->
+-                [preprocess_delete(MonotonicTS, I) || I <- Ops];
+-            (_Key, Ops) ->
++            (K, Ops) when
++                K =:= ?ds_tx_delete_topic;
++                K =:= ?ds_tx_wmark;
++                K =:= ?ds_tx_dmark
++            ->
++                [preprocess_topic_range(MonotonicTS, I) || I <- Ops];
++            (_K, Ops) ->
+                 Ops
+         end,
+         Tx
+     ).
+
+--spec preprocess_delete(emqx_ds:time(), emqx_ds:topic_range()) ->
++-spec preprocess_topic_range(emqx_ds:time(), emqx_ds:topic_range()) ->
+     {emqx_ds:topic(), emqx_ds:time(), emqx_ds:time() | infinity}.
+-preprocess_delete(MonotonicTS, {TopicFilter, From, ?ds_tx_ts_monotonic}) ->
++preprocess_topic_range(MonotonicTS, {TopicFilter, From, ?ds_tx_ts_monotonic}) ->
+     {TopicFilter, From, MonotonicTS};
+-preprocess_delete(_MonotonicTS, A) ->
++preprocess_topic_range(_MonotonicTS, A) ->
+     A.
+
+ -spec check_conflicts(
+@@ -1485,6 +1566,30 @@ prepare_del_batch(CBM, DB, Stream, TopicRange, CookOpts) ->
+             {error, recoverable, otx_backend_error}
+     end.
+
++-spec do_dump_conflicts(emqx_ds:generation(), w | d, d()) -> list() | undefined.
++do_dump_conflicts(Gen, Kind, #d{gens = Gens}) ->
++    maybe
++        #{Gen := #gen_data{dirty_w = DirtyW, dirty_d = DirtyD}} ?= Gens,
++        case Kind of
++            w -> emqx_ds_tx_conflict_trie:print(DirtyW);
++            d -> emqx_ds_tx_conflict_trie:print(DirtyD)
++        end
++    else
++        _ -> undefined
++    end.
++
++-spec do_conflict_stats(d()) -> map().
++do_conflict_stats(#d{gens = Gens}) ->
++    maps:map(
++        fun(_, #gen_data{dirty_w = DirtyW, dirty_d = DirtyD}) ->
++            #{
++                w => emqx_ds_tx_conflict_trie:get_size(DirtyW),
++                d => emqx_ds_tx_conflict_trie:get_size(DirtyD)
++            }
++        end,
++        Gens
++    ).
++
+ cast(Server, Message) ->
+     try erlang:send(Server, {'$gen_cast', Message}) of
+         _ -> ok
+diff --git a/apps/emqx_durable_storage/src/emqx_ds_pmap.erl b/apps/emqx_durable_storage/src/emqx_ds_pmap.erl
+index 1173c26a2c..d4acba5382 100644
+--- a/apps/emqx_durable_storage/src/emqx_ds_pmap.erl
++++ b/apps/emqx_durable_storage/src/emqx_ds_pmap.erl
+@@ -15,6 +15,12 @@ the pmap are of the same type and binary encoding.
+ Each key-value pair of a pmap is kept in DS individually, reducing
+ write amplification from the updates.
+
++Pmaps come in two flavors: regular (`dirty`) and `set`. `set` pmaps
++can only store one type of value: atom `true`. But they are more
++efficient.
++
++## Collections
++
+ Pmaps of different types can be grouped together into "collections".
+ Consistency is guaranteed at the level of an individual collection.
+
+@@ -43,6 +49,18 @@ hijacked by other processes.
+ Note that this mechanism only detects ownership change post-factum and
+ prevents data corruption, but doesn't _lock out_ other processes from
+ taking over the collection. Such locking is out of scope of this module.
++
++## PSet
++
++Pmap can be created with `set` kind, making it more efficient for
++storing set-like data.
++
++Bits: |I|C|S|R|
++
++R - RAM. State of the key in RAM (set 1 / unset 0).
++S - Storage. Cached, simulated state of the key in DS.
++C - Pending commit, as per last commit attempt (possibly in-flight)
++I - Inflight flag. This bit is set when transaction starts, and reset when it finishes.
+ """.
+
+ %% API:
+@@ -51,7 +69,9 @@ taking over the collection. Such locking is out of scope of this module.
+     lts_threshold_cb/2,
+
+     new_pmap/2,
++    new_pmap/3,
+     tx_restore/3,
++    tx_restore/4,
+     tx_commit/2,
+     tx_success/2,
+     tx_destroy/2,
+@@ -62,6 +82,8 @@ taking over the collection. Such locking is out of scope of this module.
+     del/3,
+     fold/3,
+     size/1,
++    to_map/1,
++    is_dirty/1,
+
+     collection_get/3,
+     collection_fold/4,
+@@ -83,6 +105,20 @@ taking over the collection. Such locking is out of scope of this module.
+     pmap_topic/3
+ ]).
+
++-ifdef(CHECK_SEQNO).
++-export([do_seqno/0]).
++-endif.
++
++-ifdef(TEST).
++%% This module plays the role of the callback module in its own tests:
++-export([
++    pmap_encode_key/2,
++    pmap_decode_key/2,
++    pmap_encode_val/3,
++    pmap_decode_val/3
++]).
++-endif.
++
+ -export_type([
+     tx_counter/0,
+     pmap/2,
+@@ -104,19 +140,50 @@ taking over the collection. Such locking is out of scope of this module.
+ %% elvis things the `size/1` call in `collection_size` is `erlang:size/1`...
+ -elvis([{elvis_style, no_common_caveats_call, disable}]).
+
++-define(pset_ram, 2#0001).
++-define(pset_stor, 2#0010).
++-define(pset_comm, 2#0100).
++-define(pset_infl, 2#1000).
++
++-define(pset_live(STATE), ((STATE band ?pset_ram) > 0)).
++
+ %%================================================================================
+ %% Type declarations
+ %%================================================================================
+
++-doc """
++WARNING: set is experimental.
++""".
++-type kind() :: dirty | set.
++
+ -type tx_counter() :: integer().
+
++-type pmap_dirty() ::
++    #pmap_dirty{
++        up_ctr :: tx_counter(),
++        comm_ctr :: tx_counter(),
++        was :: boolean(),
++        live :: boolean()
++    }.
++
++%% Dirty entries created by the versions of this module that predate
++%% the #pmap_dirty{} record. They may survive a hot code upgrade in
++%% the state of the processes that own the pmaps:
++-type legacy_dirty() :: tx_counter() | {del, tx_counter(), emqx_ds:topic()}.
++
+ -opaque pmap(K, V) ::
+     #pmap{
+         name :: binary(),
+         module :: module(),
+         cache :: #{K => V},
+-        dirty :: #{K => tx_counter() | {del, tx_counter(), emqx_ds:topic()}},
++        dirty :: #{K => pmap_dirty() | legacy_dirty()},
+         tx_counter :: tx_counter()
++    }
++    | #pset{
++        name :: binary(),
++        module :: module(),
++        data :: #{K => 0..2#1111},
++        size :: non_neg_integer()
+     }.
+
+ -type collection_id() :: binary().
+@@ -161,7 +228,7 @@ Serialized representation of the value.
+ %% Callbacks
+ %%================================================================================
+
+--callback pmap_encode_key(pmap_name(), _Key, _Val) -> key_bin().
++-callback pmap_encode_key(pmap_name(), _Key) -> key_bin().
+
+ -callback pmap_decode_key(pmap_name(), key_bin()) -> _Key.
+
+@@ -216,8 +283,14 @@ lts_threshold_cb(_, _) ->
+     infinity.
+
+ -spec new_pmap(module(), binary()) -> pmap(_K, _V).
+-new_pmap(CBM, Name) when is_atom(CBM), is_binary(Name) ->
+-    #pmap{name = Name, module = CBM}.
++new_pmap(CBM, Name) ->
++    new_pmap(CBM, Name, dirty).
++
++-spec new_pmap(module(), binary(), kind()) -> pmap(_K, _V).
++new_pmap(CBM, Name, dirty) when is_atom(CBM), is_binary(Name) ->
++    #pmap{name = Name, module = CBM};
++new_pmap(CBM, Name, set) when is_atom(CBM), is_binary(Name) ->
++    #pset{name = Name, module = CBM}.
+
+ -doc """
+ Destroy all persistent data stored in a pmap.
+@@ -238,29 +311,77 @@ This function should be called in a transaction context.
+ It does NOT clean the dirty flags for the keys:
+ that is done by `tx_success` function,
+ which should be called when the transaction succeeds.
++
++A pmap without pending changes adds no operations to the transaction.
++Its transaction counter is still stepped, to keep the counters of all
++pmaps in the collection in accord.
+ """.
+--spec tx_commit(collection_id(), pmap(K, V)) -> {tx_counter(), pmap(K, V)}.
++-spec tx_commit(collection_id(), pmap(K, V)) -> {tx_counter() | undefined, pmap(K, V)}.
+ tx_commit(
+     CollectionId,
+     #pmap{
+         name = Name,
+-        module = CBM,
+-        dirty = Dirty,
+-        cache = Cache,
+-        tx_counter = TxCntr
++        tx_counter = TxCntr,
++        dirty = Dirty
+     } = Pmap
+ ) when is_binary(CollectionId) ->
+-    maps:foreach(
+-        fun
+-            (_Key, {del, _, Topic}) ->
+-                emqx_ds:tx_del_topic(Topic);
+-            (Key, C) when is_integer(C) ->
+-                #{Key := Val} = Cache,
+-                tx_write_pmap_kv(CBM, Name, CollectionId, Key, Val)
++    case maps:size(Dirty) of
++        0 ->
++            %% Nothing to commit. Step the counter to keep it in accord
++            %% with the rest of the collection:
++            {TxCntr, Pmap#pmap{tx_counter = TxCntr + 1}};
++        _ ->
++            %% Mark the entire pmap data topic filter as dirty, to
++            %% avoid tracking conflicts for the individual keys:
++            LockedTF = pmap_topic(Name, CollectionId, '+'),
++            emqx_ds:tx_mark_dirty(LockedTF, 0, infinity, w),
++            emqx_ds:tx_mark_dirty(LockedTF, 0, infinity, d),
++            %% Dump data:
++            pmap_dump_dirty(CollectionId, Pmap),
++            {TxCntr, Pmap#pmap{tx_counter = TxCntr + 1}}
++    end;
++tx_commit(
++    CollectionId,
++    #pset{
++        name = Name,
++        module = CBM,
++        data = Data0
++    } = Pset
++) ->
++    %% Dump dirty data while setting P & I flags:
++    {Data, IsDirty} = maps:fold(
++        fun(Key, Val, {AccData, AccDirty}) ->
++            case pset_dirty(Val) of
++                false ->
++                    {AccData#{Key => Val}, AccDirty};
++                true ->
++                    Topic = pmap_topic(Name, CollectionId, encode_key(CBM, Name, Key)),
++                    case ?pset_live(Val) of
++                        true ->
++                            tx_write_pmap_kv(CBM, Name, CollectionId, Key, true),
++                            {AccData#{Key => Val bor ?pset_infl bor ?pset_comm}, true};
++                        false ->
++                            emqx_ds:tx_del_topic(Topic),
++                            {AccData#{Key => Val band (bnot ?pset_comm) bor ?pset_infl}, true}
++                    end
++            end
+         end,
+-        Dirty
++        {Data0, false},
++        Data0
+     ),
+-    {TxCntr, Pmap#pmap{tx_counter = TxCntr + 1}}.
++    case IsDirty of
++        true ->
++            %% Mark the entire pmap data topic filter as dirty, to
++            %% avoid tracking conflicts for the individual keys:
++            LockedTF = pmap_topic(Name, CollectionId, '+'),
++            emqx_ds:tx_mark_dirty(LockedTF, 0, infinity, w),
++            emqx_ds:tx_mark_dirty(LockedTF, 0, infinity, d);
++        false ->
++            ok
++    end,
++    {undefined, Pset#pset{
++        data = Data
++    }}.
+
+ -doc """
+ Commit all pmaps in the collection using `tx_commit`.
+@@ -272,19 +393,23 @@ that is done by `collection_release_dirty` function,
+ which should be called when the transaction succeeds.
+ """.
+ -spec tx_collection_commit([field(), ...], collection()) ->
+-    {tx_counter(), collection()}.
++    {tx_counter() | undefined, collection()}.
+ tx_collection_commit([_ | _] = Fields, #{id := CollectionId} = Collection) ->
+     lists:foldl(
+         fun(Field, {CntrAcc, Acc}) ->
+             #{Field := Pmap0} = Acc,
+             {Cntr, Pmap} = tx_commit(CollectionId, Pmap0),
+-            %% Verify that all pmaps in the collection were updated in
+-            %% accord:
+-            case CntrAcc of
+-                undefined -> ok;
+-                Cntr -> ok
+-            end,
+-            {Cntr, Acc#{Field := Pmap}}
++            CollCntr =
++                case Cntr of
++                    undefined ->
++                        CntrAcc;
++                    _ when CntrAcc =:= undefined ->
++                        Cntr;
++                    CntrAcc ->
++                        %% Implicit assert
++                        Cntr
++                end,
++            {CollCntr, Acc#{Field := Pmap}}
+         end,
+         {undefined, Collection},
+         Fields
+@@ -294,18 +419,25 @@ tx_collection_commit([_ | _] = Fields, #{id := CollectionId} = Collection) ->
+ Release dirty records committed by a transaction.
+ """.
+ -spec tx_success(tx_counter(), pmap(K, V)) -> pmap(K, V).
+-tx_success(Committed, Pmap = #pmap{dirty = Dirty0}) ->
+-    Dirty =
+-        maps:filter(
+-            fun
+-                (_Key, {del, TxCntr, _}) ->
+-                    TxCntr > Committed;
+-                (_Key, TxCntr) when is_integer(TxCntr) ->
+-                    TxCntr > Committed
+-            end,
+-            Dirty0
+-        ),
+-    Pmap#pmap{dirty = Dirty}.
++tx_success(Committed, Pmap = #pmap{dirty = Dirty, cache = Cache}) ->
++    Pmap#pmap{dirty = pmap_release_dirty(Committed, Cache, Dirty)};
++tx_success(_, Pmap = #pset{data = Data0}) ->
++    Data = maps:filtermap(
++        fun(_, Val0) ->
++            Val = pset_copy_comm(pset_clear_infl(Val0)),
++            case Val of
++                0 ->
++                    %% Gone from both DB and RAM, delete the key:
++                    false;
++                _ ->
++                    {true, Val}
++            end
++        end,
++        Data0
++    ),
++    Pmap#pset{
++        data = Data
++    }.
+
+ -doc """
+ Release dirty records in all pmaps in the collection.
+@@ -315,9 +447,9 @@ collection_release_dirty(Fields, Committed, Collection0) ->
+     {IsDirty, Collection} = lists:foldl(
+         fun(Field, {IsDirtyAcc, Acc}) ->
+             #{Field := Pmap0} = Acc,
+-            Pmap = #pmap{dirty = Dirty} = tx_success(Committed, Pmap0),
++            Pmap = tx_success(Committed, Pmap0),
+             {
+-                IsDirtyAcc orelse maps:size(Dirty) > 0,
++                IsDirtyAcc orelse is_dirty(Pmap),
+                 Acc#{Field := Pmap}
+             }
+         end,
+@@ -326,25 +458,42 @@ collection_release_dirty(Fields, Committed, Collection0) ->
+     ),
+     Collection#{?collection_dirty := IsDirty}.
+
++-spec tx_restore(module(), pmap_name(), collection_id()) -> pmap(_, _).
++tx_restore(CBM, Name, CollectionId) ->
++    tx_restore(CBM, Name, CollectionId, dirty).
++
+ -doc """
+ Read data from a durable storage to RAM, creating a new pmap.
+
+ This function should be called in a transaction context.
+ """.
+--spec tx_restore(module(), pmap_name(), collection_id()) -> pmap(_, _).
+-tx_restore(CBM, Name, CollectionId) when is_atom(CBM), is_binary(Name), is_binary(CollectionId) ->
+-    Cache = emqx_ds:tx_fold_topic(
++-spec tx_restore(module(), pmap_name(), collection_id(), kind()) -> pmap(_, _).
++tx_restore(CBM, Name, CollectionId, Kind) when
++    is_atom(CBM), is_binary(Name), is_binary(CollectionId)
++->
++    PData = emqx_ds:tx_fold_topic(
+         fun(_Slab, _Stream, Payload, Acc) ->
+             restore_fun(CBM, Payload, Acc)
+         end,
+         #{},
+         pmap_topic(Name, CollectionId, '+')
+     ),
+-    #pmap{
+-        name = Name,
+-        module = CBM,
+-        cache = Cache
+-    }.
++    case Kind of
++        dirty ->
++            #pmap{
++                name = Name,
++                module = CBM,
++                cache = PData
++            };
++        set ->
++            Data = maps:map(fun(_, _) -> ?pset_stor bor ?pset_ram bor ?pset_comm end, PData),
++            #pset{
++                name = Name,
++                module = CBM,
++                data = Data,
++                size = maps:size(Data)
++            }
++    end.
+
+ -doc """
+ Read data from a durable storage to RAM, creating a regular map.
+@@ -369,53 +518,129 @@ dirty_read(CBM, Name, CollectionId, FoldOptions) when
+
+ -spec get(K, pmap(K, V)) -> V | undefined.
+ get(Key, #pmap{cache = Cache}) ->
+-    maps:get(Key, Cache, undefined).
++    maps:get(Key, Cache, undefined);
++get(Key, #pset{data = Data}) ->
++    case Data of
++        #{Key := Val} when ?pset_live(Val) ->
++            true;
++        #{} ->
++            undefined
++    end.
+
+ -spec put(K, V, pmap(K, V)) -> pmap(K, V).
+ put(
+     Key,
+     Val,
+-    Pmap = #pmap{
+-        dirty = Dirty,
++    #pmap{cache = Cache0} = Pmap
++) ->
++    Cache = Cache0#{Key => Val},
++    Dirty = pmap_upd_dirty(Key, true, Pmap),
++    Pmap#pmap{
+         cache = Cache,
+-        tx_counter = TxCntr
++        dirty = Dirty
++    };
++put(
++    Key,
++    true,
++    Pmap = #pset{
++        data = Data,
++        size = Size
+     }
+ ) ->
+-    Pmap#pmap{
+-        cache = Cache#{Key => Val},
+-        dirty = Dirty#{Key => TxCntr}
+-    }.
++    case Data of
++        #{Key := Val} ->
++            Pmap#pset{
++                data = Data#{Key := Val bor ?pset_ram},
++                size =
++                    case ?pset_live(Val) of
++                        true -> Size;
++                        false -> Size + 1
++                    end
++            };
++        #{} ->
++            Pmap#pset{
++                data = Data#{Key => ?pset_ram},
++                size = Size + 1
++            }
++    end.
+
+ -spec del(collection_id(), K, pmap(K, V)) -> pmap(K, V).
+ del(
+-    CollectionId,
++    _CollectionId,
+     Key,
+-    Pmap = #pmap{
+-        name = Name,
+-        module = CBM,
+-        dirty = Dirty,
+-        cache = Cache0,
+-        tx_counter = TxCntr
++    Pmap = #pmap{cache = Cache0}
++) ->
++    Cache = maps:remove(Key, Cache0),
++    Dirty = pmap_upd_dirty(Key, false, Pmap),
++    Pmap#pmap{
++        cache = Cache,
++        dirty = Dirty
++    };
++del(
++    _CollectionId,
++    Key,
++    Pmap = #pset{
++        data = Data,
++        size = Size
+     }
+ ) ->
+-    case maps:take(Key, Cache0) of
+-        {Val, Cache} ->
+-            Topic = pmap_topic(Name, CollectionId, encode_key(CBM, Name, Key, Val)),
+-            Pmap#pmap{
+-                cache = Cache,
+-                dirty = Dirty#{Key => {del, TxCntr, Topic}}
++    case Data of
++        #{Key := Val} ->
++            Pmap#pset{
++                data = Data#{Key => Val band (bnot ?pset_ram)},
++                size =
++                    case ?pset_live(Val) of
++                        true -> Size - 1;
++                        false -> Size
++                    end
+             };
+-        error ->
++        #{} ->
+             Pmap
+     end.
+
+ -spec fold(fun((K, V, A) -> A), A, pmap(K, V)) -> A.
+ fold(Fun, Acc, #pmap{cache = Cache}) ->
+-    maps:fold(Fun, Acc, Cache).
++    maps:fold(Fun, Acc, Cache);
++fold(Fun, Acc0, #pset{data = Data}) ->
++    maps:fold(
++        fun(Key, Val, Acc) ->
++            case ?pset_live(Val) of
++                true -> Fun(Key, true, Acc);
++                false -> Acc
++            end
++        end,
++        Acc0,
++        Data
++    ).
+
+ -spec size(pmap(_K, _V)) -> non_neg_integer().
+ size(#pmap{cache = Cache}) ->
+-    maps:size(Cache).
++    maps:size(Cache);
++size(#pset{size = Size}) ->
++    Size.
++
++-spec to_map(pmap(K, V)) -> #{K => V}.
++to_map(#pmap{cache = Cache}) ->
++    Cache;
++to_map(#pset{data = Data}) ->
++    #{Key => true || Key := Val <- Data, ?pset_live(Val)}.
++
++-spec is_dirty(pmap(_K, _V)) -> boolean().
++is_dirty(#pmap{dirty = D}) ->
++    maps:size(D) > 0;
++is_dirty(#pset{data = D}) ->
++    try
++        maps:foreach(
++            fun(_, Val) ->
++                pset_dirty(Val) andalso throw(dirty)
++            end,
++            D
++        ),
++        false
++    catch
++        dirty ->
++            true
++    end.
+
+ %% == Operations with the pmap collections ==
+
+@@ -512,9 +737,9 @@ pmap_topic(Name, CollectionId, Key) ->
+ %% Internal functions
+ %%================================================================================
+
+--spec encode_key(module(), pmap_name(), _Key, _Val) -> key_bin().
+-encode_key(CBM, Name, K, V) ->
+-    CBM:pmap_encode_key(Name, K, V).
++-spec encode_key(module(), pmap_name(), _Key) -> key_bin().
++encode_key(CBM, Name, K) ->
++    CBM:pmap_encode_key(Name, K).
+
+ -spec decode_key(module(), pmap_name(), key_bin()) -> _Key.
+ decode_key(CBM, Name, KeyBin) ->
+@@ -540,8 +765,298 @@ restore_fun(CBM, {?pmap_topic(Name, _CollectionId, KeyBin), _TS, ValBin}, Acc) -
+ tx_write_pmap_kv(CBM, Name, CollectionId, Key, Val) ->
+     emqx_ds:tx_write(
+         {
+-            pmap_topic(Name, CollectionId, encode_key(CBM, Name, Key, Val)),
++            pmap_topic(Name, CollectionId, encode_key(CBM, Name, Key)),
+             0,
+             encode_val(CBM, Name, Key, Val)
+         }
+     ).
++
++%% == PMap dirty handling ==
++
++-spec pmap_upd_dirty(K, boolean(), pmap(K, _V)) -> map().
++pmap_upd_dirty(Key, Live, #pmap{tx_counter = TxCntr, dirty = Dirty, cache = Cache}) ->
++    case Dirty of
++        #{Key := Entry0} ->
++            Entry = normalize_dirty_entry(Entry0, Key, Cache),
++            case Entry of
++                #pmap_dirty{comm_ctr = TxCntr, was = Was} ->
++                    %% Previous update of the key happened after a
++                    %% successful commit, so we can mutate the
++                    %% entry:
++                    case Live of
++                        false when not Was ->
++                            %% Optimization: [empty] <- put <- del = [empty]
++                            maps:remove(Key, Dirty);
++                        _ ->
++                            Dirty#{Key := Entry#pmap_dirty{live = Live}}
++                    end;
++                _ ->
++                    %% If the key was updated before beginning of the
++                    %% current pending checkpoint, then the actual
++                    %% state of the DB is unknown (checkpoint could be
++                    %% aborted). As such, unconditionally add dirty
++                    %% entry:
++                    Dirty#{Key := Entry#pmap_dirty{live = Live, up_ctr = TxCntr}}
++            end;
++        #{} ->
++            case maps:is_key(Key, Cache) orelse Live of
++                true ->
++                    Entry = #pmap_dirty{
++                        up_ctr = TxCntr,
++                        comm_ctr = TxCntr,
++                        was = maps:is_key(Key, Cache),
++                        live = Live
++                    },
++                    Dirty#{Key => Entry};
++                false ->
++                    %% Optimization: [empty] <- del = [empty]
++                    Dirty
++            end
++    end.
++
++-spec pmap_dump_dirty(collection_id(), pmap(_K, _V)) -> ok.
++pmap_dump_dirty(CollectionId, #pmap{module = CBM, name = Name, dirty = Dirty, cache = Cache}) ->
++    maps:foreach(
++        fun(Key, Entry0) ->
++            #pmap_dirty{live = Live} = normalize_dirty_entry(Entry0, Key, Cache),
++            case Live of
++                true ->
++                    #{Key := Val} = Cache,
++                    tx_write_pmap_kv(CBM, Name, CollectionId, Key, Val);
++                false ->
++                    Topic = pmap_topic(Name, CollectionId, encode_key(CBM, Name, Key)),
++                    emqx_ds:tx_del_topic(Topic)
++            end
++        end,
++        Dirty
++    ).
++
++-spec pmap_release_dirty(tx_counter(), #{_K => _V}, map()) -> map().
++pmap_release_dirty(Committed, Cache, Dirty) ->
++    maps:filter(
++        fun(Key, Entry0) ->
++            Entry = normalize_dirty_entry(Entry0, Key, Cache),
++            Entry#pmap_dirty.up_ctr > Committed
++        end,
++        Dirty
++    ).
++
++%% Convert a dirty entry created by an older version of this module.
++%% The actual state of the DB for such entries is unknown, so they are
++%% normalized to the most conservative form: `was' is set to `true',
++%% so pending deletions are never skipped for them.
++-spec normalize_dirty_entry(pmap_dirty() | legacy_dirty(), _Key, #{_K => _V}) ->
++    pmap_dirty().
++normalize_dirty_entry(#pmap_dirty{} = Entry, _Key, _Cache) ->
++    Entry;
++normalize_dirty_entry(TxCntr, _Key, _Cache) when is_integer(TxCntr) ->
++    %% Legacy put marker: the key was live in the cache at the time:
++    #pmap_dirty{up_ctr = TxCntr, comm_ctr = TxCntr, was = true, live = true};
++normalize_dirty_entry({del, TxCntr, _Topic}, _Key, _Cache) ->
++    %% Legacy deletion marker:
++    #pmap_dirty{up_ctr = TxCntr, comm_ctr = TxCntr, was = true, live = false}.
++
++%% == PSet accessors ==
++
++-spec pset_dirty(0..2#1111) -> boolean().
++pset_dirty(Val) ->
++    pset_is_infl(Val) orelse pset_get_stor(Val) =/= pset_get_ram(Val).
++
++pset_get_ram(V) ->
++    V band ?pset_ram.
++
++pset_get_stor(V) ->
++    (V band ?pset_stor) bsr 1.
++
++pset_get_comm(V) ->
++    (V band ?pset_comm) bsr 2.
++
++pset_is_infl(V) ->
++    (V band ?pset_infl) > 0.
++
++pset_clear_infl(V) ->
++    V band (bnot ?pset_infl).
++
++pset_copy_comm(V) ->
++    case pset_get_comm(V) of
++        1 -> V bor ?pset_stor;
++        0 -> V band (bnot ?pset_stor)
++    end.
++
++%%================================================================================
++%% Tests
++%%================================================================================
++
++-ifdef(TEST).
++
++-include_lib("eunit/include/eunit.hrl").
++
++-define(test_name, <<"t">>).
++-define(test_collection, <<"c">>).
++
++%% Process dictionary keys that `emqx_ds:trans_inner' sets up for the
++%% transaction operations:
++-define(tx_ops_write, emqx_ds_tx_ctx_write).
++-define(tx_ops_del_topic, emqx_ds_tx_ctx_del_topic).
++-define(tx_ops_wmark, emqx_ds_tx_ctx_wmark).
++-define(tx_ops_dmark, emqx_ds_tx_ctx_dmark).
++
++pmap_encode_key(?test_name, K) ->
++    term_to_binary(K).
++
++pmap_decode_key(?test_name, KeyBin) ->
++    binary_to_term(KeyBin).
++
++pmap_encode_val(?test_name, _K, V) ->
++    term_to_binary(V).
++
++pmap_decode_val(?test_name, _K, ValBin) ->
++    binary_to_term(ValBin).
++
++%% Run a fun with the transaction operation keys of the process
++%% dictionary initialized the same way `emqx_ds:trans_inner' does:
++with_tx_ops(Fun) ->
++    Keys = [?tx_ops_write, ?tx_ops_del_topic, ?tx_ops_wmark, ?tx_ops_dmark],
++    [put(K, []) || K <- Keys],
++    try
++        Fun()
++    after
++        [erase(K) || K <- Keys]
++    end.
++
++dirty_tf() ->
++    [?top_data, ?test_collection, ?test_name, '+'].
++
++key_topic(K) ->
++    [?top_data, ?test_collection, ?test_name, pmap_encode_key(?test_name, K)].
++
++clean_commit_test() ->
++    P0 = new_pmap(?MODULE, ?test_name, dirty),
++    ?assertNot(is_dirty(P0)),
++    with_tx_ops(fun() ->
++        {0, P1} = tx_commit(?test_collection, P0),
++        ?assertEqual([], get(?tx_ops_write)),
++        ?assertEqual([], get(?tx_ops_del_topic)),
++        ?assertEqual([], get(?tx_ops_wmark)),
++        ?assertEqual([], get(?tx_ops_dmark)),
++        %% The counter is still stepped, to keep the counters of the
++        %% pmaps in the collection in accord:
++        {1, _} = tx_commit(?test_collection, P1)
++    end).
++
++dirty_commit_marks_the_topic_dirty_test() ->
++    P0 = put(k, v, new_pmap(?MODULE, ?test_name, dirty)),
++    with_tx_ops(fun() ->
++        {0, _} = tx_commit(?test_collection, P0),
++        ?assertEqual([{dirty_tf(), 0, infinity}], get(?tx_ops_wmark)),
++        ?assertEqual([{dirty_tf(), 0, infinity}], get(?tx_ops_dmark)),
++        ?assertEqual([{key_topic(k), 0, term_to_binary(v)}], get(?tx_ops_write))
++    end).
++
++put_del_of_a_new_key_is_a_noop_test() ->
++    P0 = del(?test_collection, k, put(k, v, new_pmap(?MODULE, ?test_name, dirty))),
++    ?assertNot(is_dirty(P0)),
++    with_tx_ops(fun() ->
++        {0, _} = tx_commit(?test_collection, P0),
++        ?assertEqual([], get(?tx_ops_write)),
++        ?assertEqual([], get(?tx_ops_del_topic)),
++        ?assertEqual([], get(?tx_ops_wmark)),
++        ?assertEqual([], get(?tx_ops_dmark))
++    end).
++
++del_of_a_missing_key_is_a_noop_test() ->
++    P0 = del(?test_collection, k, new_pmap(?MODULE, ?test_name, dirty)),
++    ?assertNot(is_dirty(P0)).
++
++del_survives_an_aborted_commit_test() ->
++    P0 = put(k, v, new_pmap(?MODULE, ?test_name, dirty)),
++    with_tx_ops(fun() ->
++        {0, P1} = tx_commit(?test_collection, P0),
++        %% The commit above "failed": tx_success is not called and the
++        %% entry stays dirty:
++        ?assert(is_dirty(P1)),
++        P2 = del(?test_collection, k, P1),
++        {1, _} = tx_commit(?test_collection, P2),
++        %% The state of the DB is unknown after the aborted commit, so
++        %% the deletion must be dumped even though the key was never
++        %% committed:
++        ?assertEqual([{key_topic(k), 0, infinity}], get(?tx_ops_del_topic))
++    end).
++
++tx_success_releases_committed_entries_test() ->
++    P0 = put(k, v, new_pmap(?MODULE, ?test_name, dirty)),
++    {0, P1} = tx_commit(?test_collection, P0),
++    P2 = tx_success(0, P1),
++    ?assertNot(is_dirty(P2)),
++    ?assertEqual(#{k => v}, to_map(P2)).
++
++legacy_put_marker_test() ->
++    P0 = #pmap{
++        name = ?test_name,
++        module = ?MODULE,
++        cache = #{k => v},
++        dirty = #{k => 0},
++        tx_counter = 1
++    },
++    with_tx_ops(fun() ->
++        {1, P1} = tx_commit(?test_collection, P0),
++        ?assertEqual([{key_topic(k), 0, term_to_binary(v)}], get(?tx_ops_write)),
++        ?assertEqual([{dirty_tf(), 0, infinity}], get(?tx_ops_wmark)),
++        P2 = tx_success(1, P1),
++        ?assertNot(is_dirty(P2))
++    end).
++
++legacy_del_marker_test() ->
++    P0 = #pmap{
++        name = ?test_name,
++        module = ?MODULE,
++        cache = #{},
++        dirty = #{k => {del, 0, key_topic(k)}},
++        tx_counter = 1
++    },
++    with_tx_ops(fun() ->
++        {1, P1} = tx_commit(?test_collection, P0),
++        ?assertEqual([{key_topic(k), 0, infinity}], get(?tx_ops_del_topic)),
++        P2 = tx_success(1, P1),
++        ?assertNot(is_dirty(P2))
++    end).
++
++legacy_marker_del_is_conservative_test() ->
++    P0 = #pmap{
++        name = ?test_name,
++        module = ?MODULE,
++        cache = #{k => v},
++        dirty = #{k => 0},
++        tx_counter = 1
++    },
++    P1 = del(?test_collection, k, P0),
++    with_tx_ops(fun() ->
++        {1, _} = tx_commit(?test_collection, P1),
++        %% The DB state behind a legacy marker is unknown, so the
++        %% deletion must be dumped:
++        ?assertEqual([{key_topic(k), 0, infinity}], get(?tx_ops_del_topic))
++    end).
++
++pset_clean_commit_test() ->
++    P0 = new_pmap(?MODULE, ?test_name, set),
++    with_tx_ops(fun() ->
++        {undefined, _} = tx_commit(?test_collection, P0),
++        ?assertEqual([], get(?tx_ops_write)),
++        ?assertEqual([], get(?tx_ops_del_topic)),
++        ?assertEqual([], get(?tx_ops_wmark)),
++        ?assertEqual([], get(?tx_ops_dmark))
++    end).
++
++pset_del_topic_uses_encoded_key_test() ->
++    P0 = put(k, true, new_pmap(?MODULE, ?test_name, set)),
++    with_tx_ops(fun() ->
++        {undefined, P1} = tx_commit(?test_collection, P0),
++        ?assertEqual([{key_topic(k), 0, term_to_binary(true)}], get(?tx_ops_write)),
++        ?assertEqual([{dirty_tf(), 0, infinity}], get(?tx_ops_wmark)),
++        P2 = tx_success(undefined, P1),
++        P3 = del(?test_collection, k, P2),
++        {undefined, _} = tx_commit(?test_collection, P3),
++        ?assertEqual([{key_topic(k), 0, infinity}], get(?tx_ops_del_topic))
++    end).
++
++-endif.
+diff --git a/apps/emqx_durable_storage/src/emqx_ds_tx_conflict_trie.erl b/apps/emqx_durable_storage/src/emqx_ds_tx_conflict_trie.erl
+index aa0f508305..268314dd09 100755
+--- a/apps/emqx_durable_storage/src/emqx_ds_tx_conflict_trie.erl
++++ b/apps/emqx_durable_storage/src/emqx_ds_tx_conflict_trie.erl
+@@ -16,6 +16,7 @@
+     push_topic/5,
+     is_dirty_topic/5,
+     rotate/1,
++    get_size/1,
+     print/1
+ ]).
+
+@@ -63,6 +64,10 @@
+ %% API functions
+ %%================================================================================
+
++-spec get_size(t()) -> non_neg_integer().
++get_size(#conflict_tree{old_trie = Old, trie = Current}) ->
++    gb_trees:size(Old) + gb_trees:size(Current).
++
+ -spec print(t()) -> map().
+ print(#conflict_tree{min_serial = Min, max_serial = Max, old_trie = Old, trie = Current}) ->
+     #{
+@@ -444,6 +449,25 @@ is_dirty3_test() ->
+     ?clean([<<1>>, '#'], 0, 0, 2, Trie),
+     ?clean(['#'], 0, 0, 2, Trie).
+
++%% A wildcard push (an explicit dirty mark) must absorb the per-key
++%% entries pushed for the same serial, while retaining their conflict
++%% information. The optimistic transaction manager relies on this when
++%% it pushes the explicit dirty marks after the implicit operations of
++%% the same transaction:
++lock_absorbs_per_key_entries_test() ->
++    T0 = new(0, infinity),
++    T1 = push_topic([<<"d">>, <<"c">>, <<"t">>, <<"k1">>], 0, 0, 1, T0),
++    T2 = push_topic([<<"d">>, <<"c">>, <<"t">>, <<"k2">>], 0, 0, 1, T1),
++    ?assertEqual(2, get_size(T2)),
++    T3 = push_topic([<<"d">>, <<"c">>, <<"t">>, '#'], 0, infinity, 1, T2),
++    ?assertEqual(1, get_size(T3)),
++    %% The absorbed entries still conflict with the readers:
++    ?dirty([<<"d">>, <<"c">>, <<"t">>, <<"k1">>], 0, T3),
++    ?dirty([<<"d">>, <<"c">>, <<"t">>, <<"k2">>], 0, T3),
++    %% But not with the transactions that started after the commit:
++    ?clean([<<"d">>, <<"c">>, <<"t">>, <<"k1">>], 1, T3),
++    ?clean([<<"d">>, <<"c">>, <<"t">>, <<"k2">>], 1, T3).
++
+ wc_prefixes_test() ->
+     ?assertEqual(
+         [['#']],
+diff --git a/apps/emqx_mq/src/emqx_mq_state_storage.erl b/apps/emqx_mq/src/emqx_mq_state_storage.erl
+index 3051a11448..a3939a2895 100644
+--- a/apps/emqx_mq/src/emqx_mq_state_storage.erl
++++ b/apps/emqx_mq/src/emqx_mq_state_storage.erl
+@@ -55,7 +55,7 @@ Persistence of Message queue state:
+ ]).
+
+ -export([
+-    pmap_encode_key/3,
++    pmap_encode_key/2,
+     pmap_decode_key/2,
+     pmap_encode_val/3,
+     pmap_decode_val/3
+@@ -413,11 +413,11 @@ mq_ids() ->
+ %% emqx_ds_pmap behaviour
+ %%------------------------------------------------------------------------------
+
+-pmap_encode_key(?pn_shard_progress, Shard = _Key, _Val) when is_binary(Shard) ->
++pmap_encode_key(?pn_shard_progress, Shard = _Key) when is_binary(Shard) ->
+     Shard;
+-pmap_encode_key(?pn_mq, ?mq_key, _Val) ->
++pmap_encode_key(?pn_mq, ?mq_key) ->
+     ?mq_key_bin;
+-pmap_encode_key(?pn_id, ?id_key, _Val) ->
++pmap_encode_key(?pn_id, ?id_key) ->
+     ?id_key_bin.
+
+ pmap_decode_key(?pn_shard_progress, Shard = _KeyBin) ->
+diff --git a/changes/ee/perf-19997.en.md b/changes/ee/perf-19997.en.md
+new file mode 100644
+index 0000000000..ff6885b11d
+--- /dev/null
++++ b/changes/ee/perf-19997.en.md
+@@ -0,0 +1,13 @@
++Performance improvement for durable sessions publishing QoS2 messages.
++
++- The persistent map backing the session state storage skips the
++  storage operations that would not change anything, such as the
++  deletion of a key that is known to be absent.
++
++- Reduced the memory used by optimistic transactions on the
++  durable-session data. The optimistic transaction manager can now
++  track conflicts for an entire topic filter instead of the individual
++  keys within it, and the persistent-map layer marks the topic filters
++  of the collections it commits as dirty. Together this reduces the
++  size of the in-RAM conflict index that each durable-storage shard
++  process keeps for the session data.
