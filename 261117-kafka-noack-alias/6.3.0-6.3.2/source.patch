@@ -1,0 +1,12 @@
+diff --git a/src/wolff_producer.erl b/src/wolff_producer.erl
+--- a/src/wolff_producer.erl
++++ b/src/wolff_producer.erl
+@@ -719,4 +719,6 @@
+-%% when require no acks do not add to sent_reqs and ack caller immediately
+-maybe_fake_kafka_ack(_NoAck = true, St) ->
++%% Complete requests immediately when Kafka acknowledgments are disabled.
++maybe_fake_kafka_ack(_NoAck = true, #{sent_reqs := SentReqs} = St) ->
++  {value, #{req_ref := {alias, Ref}}} = queue:peek(SentReqs),
++  erlang:unalias(Ref),
+   do_handle_kafka_ack(?no_error, ?UNKNOWN_OFFSET, St);
+ maybe_fake_kafka_ack(_NoAck, St) -> St.
