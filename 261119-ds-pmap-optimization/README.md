@@ -15,13 +15,15 @@ emqx_ds_shared_sub_dl.beam                emqx_mq_state_storage.beam
 ## What grows
 
 A durable session tracks every QoS2 message it receives in the `awaiting_rel` map: one key
-added on PUBREC, the same key deleted on PUBCOMP. Until this patch, both updates reached the
+added when the PUBLISH arrives (the broker answers PUBREC), the same key deleted when the
+PUBREL arrives (the broker answers PUBCOMP). Until this patch, both updates reached the
 optimistic transaction manager of the session's shard as **per-key** entries in its conflict
-index, and the deletion of an absent key still produced a storage operation. The entries are
-kept for the conflict window, so the index grows with the message rate and does not settle.
-In the validation below the shard managers grew by roughly 40 MB per 1,000 msg/s of sustained
-QoS2 traffic until the node ran out of memory; see
-[Source and validation](#source-and-validation).
+index, and the deletion of an absent key still produced a storage operation. The write side of
+the index is rotated every conflict window, but the deletion side is never rotated: a deletion
+entry lives until the shard's transaction manager process restarts, in practice until the node
+restarts. So the index grows with every QoS2 message and does not settle, and a garbage
+collection of the process frees little. Measured on 6.3.3, each QoS2 message leaves about 350 to
+430 bytes in the manager's heap; see [Source and validation](#source-and-validation).
 
 The patch marks the topic filter of each pmap collection as a single conflict unit
 (`emqx_ds:tx_mark_dirty/4`), so per-key entries collapse into one wildcard entry per
