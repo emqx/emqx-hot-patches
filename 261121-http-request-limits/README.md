@@ -17,6 +17,7 @@ gun). The modules depend on each other, so the patch comes with a loader module,
 | An HTTP/1.1 request body with a chunk size of more than 16 hex digits is rejected. | `5.8` to `6.3.0-6.3.2` |
 | An HTTP/2 header block that encodes an integer of more than 38 bits is rejected with a connection error. | `5.8` to `6.3.0-6.3.2` |
 | An HTTP/2 header block sent in several frames is limited to 32 KB. | `5.8` |
+| An HTTP/1.1 response with a CR or LF character in a header value is not sent. EMQX sends an empty response with status 500 and closes the connection. | `6.3.3` |
 | The other changes of cowlib 2.22.0 since 2.21.0, for example: an HTTP/1.1 chunk size must start with a hex digit, and the padding of HTTP/2 DATA frames counts in flow control. | `6.3.3` |
 
 EMQX 6.3.3 already has the chunk size and integer limits, and 5.9 and later already have the limit
@@ -208,7 +209,7 @@ To roll the patch back, remove the same files and restart the node.
 | `5.9` | 2.13.0 → `2.13.0-emqx-3` | 2.9.2 → `2.9.2-emqx-1` | not changed | Erlang/OTP 27.3.4.2-8 |
 | `5.10`, `6.0` | 2.14.0 → `2.14.0-emqx-3` | `2.13.0-emqx-2` → `2.13.0-emqx-2.1` | not changed | Erlang/OTP 27.3.4.2-8 |
 | `6.1`, `6.2`, `6.3.0-6.3.2` | 2.14.0 → `2.14.0-emqx-3` | `2.13.0-emqx-2` → `2.13.0-emqx-2.1` | not changed | Erlang/OTP 28.4.1-10 |
-| `6.3.3` | 2.21.0 → 2.22.0 | `2.13.0-emqx-5` → commit `a971f9a` ([emqx/cowboy#18](https://github.com/emqx/cowboy/pull/18)) | 2.7.0 → 2.8.0 | Erlang/OTP 28.4.1-10 |
+| `6.3.3` | 2.21.0 → 2.22.0 | `2.13.0-emqx-5` → commit `7c93b7e` ([emqx/cowboy#18](https://github.com/emqx/cowboy/pull/18)) | 2.7.0 → 2.8.0 | Erlang/OTP 28.4.1-10 |
 
 - Directories on the same row hold identical files.
 - Each directory holds the modules whose compiled code differs between the two versions, and
