@@ -209,7 +209,7 @@ To roll the patch back, remove the same files and restart the node.
 | `5.9` | 2.13.0 → `2.13.0-emqx-3` | 2.9.2 → `2.9.2-emqx-1` | not changed | Erlang/OTP 27.3.4.2-8 |
 | `5.10`, `6.0` | 2.14.0 → `2.14.0-emqx-3` | `2.13.0-emqx-2` → `2.13.0-emqx-2.1` | not changed | Erlang/OTP 27.3.4.2-8 |
 | `6.1`, `6.2`, `6.3.0-6.3.2` | 2.14.0 → `2.14.0-emqx-3` | `2.13.0-emqx-2` → `2.13.0-emqx-2.1` | not changed | Erlang/OTP 28.4.1-10 |
-| `6.3.3` | 2.21.0 → 2.22.0 | `2.13.0-emqx-5` → commit `7c93b7e` ([emqx/cowboy#18](https://github.com/emqx/cowboy/pull/18)) | 2.7.0 → 2.8.0 | Erlang/OTP 28.4.1-10 |
+| `6.3.3` | 2.21.0 → 2.22.0 | `2.13.0-emqx-5` → `2.13.0-emqx-6` | 2.7.0 → 2.8.0 | Erlang/OTP 28.4.1-10 |
 
 - Directories on the same row hold identical files.
 - Each directory holds the modules whose compiled code differs between the two versions, and
