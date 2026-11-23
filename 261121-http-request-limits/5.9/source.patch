@@ -1,0 +1,750 @@
+diff --git a/cowlib/src/cow_hpack.erl b/cowlib/src/cow_hpack.erl
+index d7ae475..5ecfea1 100644
+--- a/cowlib/src/cow_hpack.erl
++++ b/cowlib/src/cow_hpack.erl
+@@ -187,6 +187,10 @@ dec_lit_no_index(Rest, State, Acc, Name) ->
+ %% The HPACK format has 4 different integer prefixes length (from 4 to 7)
+ %% and each can be used to create an indefinite length integer if all bits
+ %% of the prefix are set to 1.
++%%
++%% We hard limit indefinite length integers to 38bits. The maximum
++%% possible value is large enough for normal use cases and does
++%% not produce an Erlang big int.
+ 
+ dec_int5(<< 2#11111:5, Rest/bits >>) ->
+ 	dec_big_int(Rest, 31, 0);
+@@ -195,7 +199,7 @@ dec_int5(<< Int:5, Rest/bits >>) ->
+ 
+ dec_big_int(<< 0:1, Value:7, Rest/bits >>, Int, M) ->
+ 	{Int + (Value bsl M), Rest};
+-dec_big_int(<< 1:1, Value:7, Rest/bits >>, Int, M) ->
++dec_big_int(<< 1:1, Value:7, Rest/bits >>, Int, M) when M < 32 ->
+ 	dec_big_int(Rest, Int + (Value bsl M), M + 7).
+ 
+ %% Decode a string.
+@@ -254,6 +258,15 @@ decode_reject_eos_test() ->
+ 	{'EXIT', _} = (catch decode(<<16#0085f2b24a84ff874951fffffffa7f:120>>)),
+ 	ok.
+ 
++decode_reject_very_big_int_test() ->
++	VeryBigInt0 = binary:copy(<<16#ff>>, 32767),
++	VeryBigInt = <<VeryBigInt0/binary, 16#7f>>,
++	garbage_collect(),
++	Prev = process_flag(max_heap_size, #{size => 10000, kill => true}),
++	{'EXIT', _} = (catch decode(VeryBigInt)),
++	process_flag(max_heap_size, Prev),
++	ok.
++
+ req_decode_test() ->
+ 	%% First request (raw then huffman).
+ 	{Headers1, State1} = decode(<< 16#828684410f7777772e6578616d706c652e636f6d:160 >>),
+diff --git a/cowlib/src/cow_http2_machine.erl b/cowlib/src/cow_http2_machine.erl
+index 69df267..a8a7408 100644
+--- a/cowlib/src/cow_http2_machine.erl
++++ b/cowlib/src/cow_http2_machine.erl
+@@ -52,6 +52,7 @@
+ 	max_fragmented_header_block_size => 16384..16#7fffffff,
+ 	max_frame_size_received => 16384..16777215,
+ 	max_frame_size_sent => 16384..16777215 | infinity,
++	max_header_list_size => 0..16#ffffffff | infinity,
+ 	max_stream_window_size => 0..16#7fffffff,
+ 	message_tag => any(),
+ 	preface_timeout => timeout(),
+@@ -260,8 +261,11 @@ settings_init(Opts) ->
+ 		initial_window_size, 65535),
+ 	S3 = setting_from_opt(S2, Opts, max_frame_size_received,
+ 		max_frame_size, 16384),
+-	%% @todo max_header_list_size
+-	setting_from_opt(S3, Opts, enable_connect_protocol,
++	%% We use a default of 32768 even though the protocol
++	%% default is infinity.
++	S4 = setting_from_opt(S3, Opts, max_header_list_size,
++		max_header_list_size, infinity, 32768),
++	setting_from_opt(S4, Opts, enable_connect_protocol,
+ 		enable_connect_protocol, false).
+ 
+ setting_from_opt(Settings, Opts, OptName, SettingName, Default) ->
+@@ -270,6 +274,15 @@ setting_from_opt(Settings, Opts, OptName, SettingName, Default) ->
+ 		Value -> Settings#{SettingName => Value}
+ 	end.
+ 
++setting_from_opt(Settings, Opts, OptName, SettingName,
++		Default, DefaultIfMissing) ->
++	case Opts of
++		#{OptName := Default} -> Settings;
++		#{OptName := Value} -> Settings#{SettingName => Value};
++		#{} when Default =:= DefaultIfMissing -> Settings;
++		#{} -> Settings#{SettingName => DefaultIfMissing}
++	end.
++
+ -spec init_stream(binary(), State)
+ 	-> {ok, cow_http2:streamid(), State} when State::http2_machine().
+ init_stream(Method, State=#http2_machine{mode=client, local_streamid=LocalStreamID,
+@@ -532,12 +545,25 @@ client_headers_frame(_, State) ->
+ headers_decode(Frame=#headers{head=head_fin, data=HeaderData},
+ 		State=#http2_machine{decode_state=DecodeState0}, Type, Stream) ->
+ 	try cow_hpack:decode(HeaderData, DecodeState0) of
+-		{Headers, DecodeState} when Type =:= request ->
+-			headers_enforce_concurrency_limit(Frame,
+-				State#http2_machine{decode_state=DecodeState}, Type, Stream, Headers);
+ 		{Headers, DecodeState} ->
+-			headers_pseudo_headers(Frame,
+-				State#http2_machine{decode_state=DecodeState}, Type, Stream, Headers)
++			State1 = State#http2_machine{decode_state=DecodeState},
++			%% The whole block is decoded so the HPACK table
++			%% stays aligned with the peer. The limit applies
++			%% to the finished list because a failure during
++			%% decode is a connection error. (RFC9113 4.3)
++			%% This is safe because large binaries are
++			%% referenced rather than copied at this point.
++			case header_list_within_limit(Headers, State1) of
++				true when Type =:= request ->
++					headers_enforce_concurrency_limit(Frame, State1,
++						Type, Stream, Headers);
++				true ->
++					headers_pseudo_headers(Frame, State1, Type, Stream, Headers);
++				false ->
++					{error, {stream_error, Frame#headers.id, enhance_your_calm,
++						'The header list size is larger than the configured limit. (RFC9113 6.5.2)'},
++						header_list_reject(Type, Frame, State1)}
++			end
+ 	catch _:_ ->
+ 		{error, {connection_error, compression_error,
+ 			'Error while trying to decode HPACK-encoded header block. (RFC7540 4.3)'},
+@@ -559,6 +585,310 @@ headers_enforce_concurrency_limit(Frame=#headers{id=StreamID},
+ 				State}
+ 	end.
+ 
++header_list_within_limit(Headers, #http2_machine{
++		local_settings=Local, next_settings=Next}) ->
++	case header_list_size_limit(Next, Local) of
++		infinity ->
++			true;
++		Limit ->
++			header_list_size(Headers, Limit, 0)
++	end.
++
++header_list_size_limit(#{max_header_list_size := Limit}, _) ->
++	Limit;
++header_list_size_limit(_, #{max_header_list_size := Limit}) ->
++	Limit;
++header_list_size_limit(_, _) ->
++	infinity.
++
++header_list_size([], _, _) ->
++	true;
++header_list_size([{Name, Value}|Tail], Limit, Size) ->
++	Size1 = Size + byte_size(Name) + byte_size(Value) + 32,
++	case Size1 > Limit of
++		true ->
++			false;
++		false ->
++			header_list_size(Tail, Limit, Size1)
++	end.
++
++%% The promised response may already be in flight. Close the id
++%% so those frames are ignored. (RFC7540 5.1, RFC7540 6.6)
++header_list_reject(push_promise, #headers{id=PromisedStreamID}, State) ->
++	stream_linger(PromisedStreamID,
++		State#http2_machine{remote_streamid=PromisedStreamID});
++%% The stream is already open. Drop it so later frames are ignored
++%% and it does not keep a concurrency slot.
++header_list_reject(Type, #headers{id=StreamID},
++		State=#http2_machine{streams=Streams0})
++		when Type =:= response; Type =:= trailers ->
++	Streams = maps:remove(StreamID, Streams0),
++	stream_linger(StreamID, State#http2_machine{streams=Streams});
++%% The request never became a stream. Close the id so frames the
++%% client already sent for it, such as the request body, are ignored.
++header_list_reject(request, #headers{id=StreamID}, State) ->
++	stream_linger(StreamID,
++		State#http2_machine{remote_streamid=StreamID}).
++
++-ifdef(TEST).
++
++header_list_size_default_advertised_test() ->
++	{ok, _, S0} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	#{max_header_list_size := 32768} = S0#http2_machine.next_settings,
++	{ok, _, S1} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity,
++		max_header_list_size => infinity
++	}),
++	false = maps:is_key(max_header_list_size, S1#http2_machine.next_settings),
++	{ok, _, S2} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity,
++		max_header_list_size => 65536
++	}),
++	#{max_header_list_size := 65536} = S2#http2_machine.next_settings,
++	ok.
++
++header_list_size_indexed_test() ->
++	%% Eight copies are within 32768. Nine are not. Counting the
++	%% shared value once would accept nine.
++	ValueA = binary:copy(<<$a>>, 4000),
++	ValueB = binary:copy(<<$b>>, 4000),
++	Headers = [
++		{<<":method">>, <<"GET">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	],
++	{Block8, Enc1} = cow_hpack:encode(
++		Headers ++ lists:duplicate(8, {<<"user-agent">>, ValueA}),
++		cow_hpack:init(), #{huffman => false}),
++	{Block9, Enc2} = cow_hpack:encode(
++		Headers ++ lists:duplicate(9, {<<"user-agent">>, ValueB}),
++		Enc1, #{huffman => false}),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	Decode0 = S0#http2_machine.decode_state,
++	{ok, {headers, 1, fin, _, _, _}, S1}
++		= frame({headers, 1, fin, head_fin, iolist_to_binary(Block8)}, S0),
++	true = S1#http2_machine.decode_state =/= Decode0,
++	{error, {stream_error, 3, enhance_your_calm, _}, S2}
++		= frame({headers, 3, fin, head_fin, iolist_to_binary(Block9)}, S1),
++	%% The rejected block was decoded: the dynamic table now has
++	%% the "b" value, not the "a" value from the previous request.
++	{Follow, _} = cow_hpack:encode(
++		Headers ++ [{<<"user-agent">>, ValueB}],
++		Enc2, #{huffman => false}),
++	{ok, {headers, 5, fin, [{<<"user-agent">>, Referenced}], _, _}, _}
++		= frame({headers, 5, fin, head_fin, iolist_to_binary(Follow)}, S2),
++	4000 = byte_size(Referenced),
++	$b = binary:first(Referenced),
++	ok.
++
++header_list_size_request_body_test() ->
++	%% A rejected request can have its body in flight. The DATA
++	%% frames must be ignored and the connection stay usable.
++	Headers = [
++		{<<":method">>, <<"POST">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	],
++	{Big, Enc1} = cow_hpack:encode(
++		Headers ++ lists:duplicate(9, {<<"user-agent">>, binary:copy(<<$a>>, 4000)}),
++		cow_hpack:init(), #{huffman => false}),
++	{Small, _} = cow_hpack:encode(Headers, Enc1, #{huffman => false}),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	{error, {stream_error, 1, enhance_your_calm, _}, S1}
++		= frame({headers, 1, nofin, head_fin, iolist_to_binary(Big)}, S0),
++	true = is_lingering_stream(1, S1),
++	{ok, S2} = frame({data, 1, nofin, <<"body">>}, S1),
++	{ok, S3} = frame({data, 1, fin, <<"more">>}, S2),
++	{ok, {headers, 3, fin, _, _, _}, _}
++		= frame({headers, 3, fin, head_fin, iolist_to_binary(Small)}, S3),
++	ok.
++
++header_list_size_before_and_after_ack_test() ->
++	Value = binary:copy(<<$a>>, 4000),
++	Headers = [
++		{<<":method">>, <<"GET">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	],
++	{Block0, _} = cow_hpack:encode(
++		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
++		cow_hpack:init(), #{huffman => false}),
++	Block = iolist_to_binary(Block0),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	{error, {stream_error, 1, enhance_your_calm, _}, _}
++		= frame({headers, 1, fin, head_fin, Block}, S0),
++	{ok, S1} = frame(settings_ack, S0),
++	{error, {stream_error, 1, enhance_your_calm, _}, _}
++		= frame({headers, 1, fin, head_fin, Block}, S1),
++	ok.
++
++header_list_size_infinity_test() ->
++	Value = binary:copy(<<$a>>, 4000),
++	Headers = [
++		{<<":method">>, <<"GET">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	],
++	{Block0, _} = cow_hpack:encode(
++		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
++		cow_hpack:init(), #{huffman => false}),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity,
++		max_header_list_size => infinity
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	{ok, {headers, 1, fin, _, _, _}, _}
++		= frame({headers, 1, fin, head_fin, iolist_to_binary(Block0)}, S0),
++	ok.
++
++header_list_size_zero_test() ->
++	{Block0, _} = cow_hpack:encode([
++		{<<":method">>, <<"GET">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	]),
++	Block = iolist_to_binary(Block0),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity,
++		max_header_list_size => 0
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	{error, {stream_error, 1, enhance_your_calm, _}, _}
++		= frame({headers, 1, fin, head_fin, Block}, S0),
++	ok.
++
++header_list_size_response_test() ->
++	%% :status 200 is 42 octets. user-agent adds 42 + ValueSize.
++	At = 32768 - (42 + 42),
++	32768 = 42 + 42 + At,
++	{AtBlock, _} = cow_hpack:encode([
++		{<<":status">>, <<"200">>},
++		{<<"user-agent">>, binary:copy(<<$a>>, At)}
++	], cow_hpack:init(), #{huffman => false}),
++	{OverBlock, _} = cow_hpack:encode([
++		{<<":status">>, <<"200">>},
++		{<<"user-agent">>, binary:copy(<<$a>>, At + 1)}
++	], cow_hpack:init(), #{huffman => false}),
++	{Small, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
++	{ok, _, C00} = init(client, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	{ok, C0} = frame({settings, #{}}, C00),
++	{ok, 1, C1} = init_stream(<<"GET">>, C0),
++	{ok, {headers, 1, fin, _, _, _}, _}
++		= frame({headers, 1, fin, head_fin, iolist_to_binary(AtBlock)}, C1),
++	{error, {stream_error, 1, enhance_your_calm, _}, C2}
++		= frame({headers, 1, fin, head_fin, iolist_to_binary(OverBlock)}, C1),
++	%% The stream is gone and its id lingers. Later DATA frames
++	%% on that id are ignored.
++	undefined = stream_get(1, C2),
++	{ok, C3} = frame({data, 1, fin, <<"x">>}, C2),
++	{ok, 3, C4} = init_stream(<<"GET">>, C3),
++	{ok, {headers, 3, fin, _, _, _}, _}
++		= frame({headers, 3, fin, head_fin, iolist_to_binary(Small)}, C4),
++	ok.
++
++header_list_size_push_promise_test() ->
++	Value = binary:copy(<<$a>>, 4000),
++	Headers = [
++		{<<":method">>, <<"GET">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	],
++	{Over0, _} = cow_hpack:encode(
++		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
++		cow_hpack:init(), #{huffman => false}),
++	Over = iolist_to_binary(Over0),
++	{Min0, _} = cow_hpack:encode(Headers),
++	Min = iolist_to_binary(Min0),
++	{ok, _, C00} = init(client, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	{ok, C0} = frame({settings, #{}}, C00),
++	{ok, 1, C1} = init_stream(<<"GET">>, C0),
++	{error, {stream_error, 2, enhance_your_calm, _}, C2}
++		= frame({push_promise, 1, head_fin, 2, Over}, C1),
++	2 = get_last_streamid(C2),
++	%% The promised response may already be in flight.
++	{ok, C3} = frame({data, 2, fin, <<"hi">>}, C2),
++	{ok, {push_promise, 1, 4, _, _}, C4}
++		= frame({push_promise, 1, head_fin, 4, Min}, C3),
++	{Small0, _} = cow_hpack:encode([{<<":status">>, <<"200">>}]),
++	{ok, {headers, 1, fin, _, _, _}, _}
++		= frame({headers, 1, fin, head_fin, iolist_to_binary(Small0)}, C4),
++	ok.
++
++header_list_size_continuation_test() ->
++	Value = binary:copy(<<$a>>, 4000),
++	Headers = [
++		{<<":method">>, <<"GET">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	],
++	{Block0, _} = cow_hpack:encode(
++		Headers ++ lists:duplicate(9, {<<"user-agent">>, Value}),
++		cow_hpack:init(), #{huffman => false}),
++	<<First:1/binary, Rest/binary>> = iolist_to_binary(Block0),
++	{Min0, _} = cow_hpack:encode(Headers),
++	Min = iolist_to_binary(Min0),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity,
++		max_fragmented_header_block_size => 65536
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	{ok, S1} = frame({headers, 1, fin, head_nofin, First}, S0),
++	{error, {stream_error, 1, enhance_your_calm, _}, S2}
++		= frame({continuation, 1, head_fin, Rest}, S1),
++	{ok, {headers, 3, fin, _, _, _}, _}
++		= frame({headers, 3, fin, head_fin, Min}, S2),
++	ok.
++
++header_list_size_trailers_test() ->
++	Value = binary:copy(<<$a>>, 4000),
++	{Req0, Enc} = cow_hpack:encode([
++		{<<":method">>, <<"POST">>},
++		{<<":scheme">>, <<"http">>},
++		{<<":path">>, <<"/">>}
++	]),
++	{Trailers0, _} = cow_hpack:encode(
++		lists:duplicate(9, {<<"x-trailer">>, Value}),
++		Enc, #{huffman => false}),
++	{ok, _, S00} = init(server, #{
++		preface_timeout => infinity,
++		settings_timeout => infinity
++	}),
++	{ok, S0} = frame({settings, #{}}, S00),
++	{ok, {headers, 1, nofin, _, _, _}, S1}
++		= frame({headers, 1, nofin, head_fin, iolist_to_binary(Req0)}, S0),
++	{error, {stream_error, 1, enhance_your_calm, _}, S2}
++		= frame({headers, 1, fin, head_fin, iolist_to_binary(Trailers0)}, S1),
++	undefined = stream_get(1, S2),
++	ok.
++
++-endif.
++
+ headers_pseudo_headers(Frame, State=#http2_machine{local_settings=LocalSettings},
+ 		Type, Stream, Headers0) when Type =:= request; Type =:= push_promise ->
+ 	IsExtendedConnectEnabled = maps:get(enable_connect_protocol, LocalSettings, false),
+diff --git a/cowlib/src/cow_http_te.erl b/cowlib/src/cow_http_te.erl
+index e3473cf..c78b5db 100644
+--- a/cowlib/src/cow_http_te.erl
++++ b/cowlib/src/cow_http_te.erl
+@@ -138,7 +138,7 @@ stream_chunked(Data, State) ->
+ 
+ %% New chunk.
+ stream_chunked(Data = << C, _/bits >>, {0, Streamed}, Acc) when C =/= $\r ->
+-	case chunked_len(Data, Streamed, Acc, 0) of
++	case chunked_len(Data, Streamed, Acc, 0, 0) of
+ 		{next, Rest, State, Acc2} ->
+ 			stream_chunked(Rest, State, Acc2);
+ 		{more, State, Acc2} ->
+@@ -174,54 +174,54 @@ stream_chunked(Data, {Rem, Streamed}, Acc) when Rem > 2 ->
+ 			{more, << Acc/binary, Data/binary >>, Rem2, {Rem2, Streamed + DataSize}}
+ 	end.
+ 
+-chunked_len(<< $0, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16);
+-chunked_len(<< $1, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 1);
+-chunked_len(<< $2, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 2);
+-chunked_len(<< $3, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 3);
+-chunked_len(<< $4, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 4);
+-chunked_len(<< $5, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 5);
+-chunked_len(<< $6, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 6);
+-chunked_len(<< $7, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 7);
+-chunked_len(<< $8, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 8);
+-chunked_len(<< $9, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 9);
+-chunked_len(<< $A, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 10);
+-chunked_len(<< $B, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 11);
+-chunked_len(<< $C, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 12);
+-chunked_len(<< $D, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 13);
+-chunked_len(<< $E, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 14);
+-chunked_len(<< $F, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 15);
+-chunked_len(<< $a, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 10);
+-chunked_len(<< $b, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 11);
+-chunked_len(<< $c, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 12);
+-chunked_len(<< $d, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 13);
+-chunked_len(<< $e, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 14);
+-chunked_len(<< $f, R/bits >>, S, A, Len) -> chunked_len(R, S, A, Len * 16 + 15);
++chunked_len(<< $0, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16, D + 1);
++chunked_len(<< $1, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 1, D + 1);
++chunked_len(<< $2, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 2, D + 1);
++chunked_len(<< $3, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 3, D + 1);
++chunked_len(<< $4, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 4, D + 1);
++chunked_len(<< $5, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 5, D + 1);
++chunked_len(<< $6, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 6, D + 1);
++chunked_len(<< $7, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 7, D + 1);
++chunked_len(<< $8, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 8, D + 1);
++chunked_len(<< $9, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 9, D + 1);
++chunked_len(<< $A, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 10, D + 1);
++chunked_len(<< $B, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 11, D + 1);
++chunked_len(<< $C, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 12, D + 1);
++chunked_len(<< $D, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 13, D + 1);
++chunked_len(<< $E, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 14, D + 1);
++chunked_len(<< $F, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 15, D + 1);
++chunked_len(<< $a, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 10, D + 1);
++chunked_len(<< $b, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 11, D + 1);
++chunked_len(<< $c, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 12, D + 1);
++chunked_len(<< $d, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 13, D + 1);
++chunked_len(<< $e, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 14, D + 1);
++chunked_len(<< $f, R/bits >>, S, A, Len, D) when D < 16 -> chunked_len(R, S, A, Len * 16 + 15, D + 1);
+ %% Chunk extensions.
+ %%
+ %% Note that we currently skip the first character we encounter here,
+ %% and not in the skip_chunk_ext function. If we latter implement
+ %% chunk extensions (unlikely) we will need to change this clause too.
+-chunked_len(<< C, R/bits >>, S, A, Len) when ?IS_WS(C); C =:= $; -> skip_chunk_ext(R, S, A, Len, 0);
++chunked_len(<< C, R/bits >>, S, A, Len, _) when ?IS_WS(C); C =:= $; -> skip_chunk_ext(R, S, A, Len, 0);
+ %% Final chunk.
+ %%
+ %% When trailers are following we simply return them as the Rest.
+ %% Then the user code can decide to call the stream_trailers function
+ %% to parse them. The user can therefore ignore trailers as necessary
+ %% if they do not wish to handle them.
+-chunked_len(<< "\r\n\r\n", R/bits >>, _, <<>>, 0) -> {done, no_trailers, R};
+-chunked_len(<< "\r\n\r\n", R/bits >>, _, A, 0) -> {done, A, no_trailers, R};
+-chunked_len(<< "\r\n", R/bits >>, _, <<>>, 0) when byte_size(R) > 2 -> {done, trailers, R};
+-chunked_len(<< "\r\n", R/bits >>, _, A, 0) when byte_size(R) > 2 -> {done, A, trailers, R};
+-chunked_len(_, _, _, 0) -> more;
++chunked_len(<< "\r\n\r\n", R/bits >>, _, <<>>, 0, _) -> {done, no_trailers, R};
++chunked_len(<< "\r\n\r\n", R/bits >>, _, A, 0, _) -> {done, A, no_trailers, R};
++chunked_len(<< "\r\n", R/bits >>, _, <<>>, 0, _) when byte_size(R) > 2 -> {done, trailers, R};
++chunked_len(<< "\r\n", R/bits >>, _, A, 0, _) when byte_size(R) > 2 -> {done, A, trailers, R};
++chunked_len(_, _, _, 0, _) -> more;
+ %% Normal chunk. Add 2 to Len for the trailing \r\n.
+-chunked_len(<< "\r\n", R/bits >>, S, A, Len) -> {next, R, {Len + 2, S}, A};
+-chunked_len(<<"\r">>, _, <<>>, _) -> more;
+-chunked_len(<<"\r">>, S, A, _) -> {more, {0, S}, A};
+-chunked_len(<<>>, _, <<>>, _) -> more;
+-chunked_len(<<>>, S, A, _) -> {more, {0, S}, A}.
+-
+-skip_chunk_ext(R = << "\r", _/bits >>, S, A, Len, _) -> chunked_len(R, S, A, Len);
+-skip_chunk_ext(R = <<>>, S, A, Len, _) -> chunked_len(R, S, A, Len);
++chunked_len(<< "\r\n", R/bits >>, S, A, Len, _) -> {next, R, {Len + 2, S}, A};
++chunked_len(<<"\r">>, _, <<>>, _, _) -> more;
++chunked_len(<<"\r">>, S, A, _, _) -> {more, {0, S}, A};
++chunked_len(<<>>, _, <<>>, _, _) -> more;
++chunked_len(<<>>, S, A, _, _) -> {more, {0, S}, A}.
++
++skip_chunk_ext(R = << "\r", _/bits >>, S, A, Len, _) -> chunked_len(R, S, A, Len, 0);
++skip_chunk_ext(R = <<>>, S, A, Len, _) -> chunked_len(R, S, A, Len, 0);
+ %% We skip up to 128 characters of chunk extensions. The value
+ %% is hardcoded: chunk extensions are very rarely seen in the
+ %% wild and Cowboy doesn't do anything with them anyway.
+@@ -305,6 +305,7 @@ stream_chunked_n_passes_test() ->
+ 	{more, <<"abc">>, 2, {2, 3}} = stream_chunked(<<"\n3\r\nabc">>, {1, 0}),
+ 	{more, <<"abc">>, {1, 3}} = stream_chunked(<<"3\r\nabc\r">>, {0, 0}),
+ 	{more, <<"abc">>, <<"123">>, {0, 3}} = stream_chunked(<<"3\r\nabc\r\n123">>, {0, 0}),
++	{more, <<>>, 18446744073709551617, _} = stream_chunked(<<"FFFFFFFFFFFFFFFF\r\n">>, {0, 0}),
+ 	ok.
+ 
+ stream_chunked_dripfeed_test() ->
+@@ -339,7 +340,8 @@ stream_chunked_dripfeed2_test() ->
+ stream_chunked_error_test_() ->
+ 	Tests = [
+ 		{<<>>, undefined},
+-		{<<"\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">>, {2, 0}}
++		{<<"\n\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa">>, {2, 0}},
++		{<<"10000000000000000\r\n">>, {0, 0}}
+ 	],
+ 	[{lists:flatten(io_lib:format("value ~p state ~p", [V, S])),
+ 		fun() -> {'EXIT', _} = (catch stream_chunked(V, S)) end}
+diff --git a/cowboy/src/cowboy_http.erl b/cowboy/src/cowboy_http.erl
+index 57e1978..2f615a2 100644
+--- a/cowboy/src/cowboy_http.erl
++++ b/cowboy/src/cowboy_http.erl
+@@ -72,6 +72,7 @@
+ 	qs = undefined :: binary(),
+ 	version = undefined :: cowboy:http_version(),
+ 	headers = undefined :: cowboy:http_headers() | undefined,
++	num_headers = 0 :: non_neg_integer(),
+ 	name = undefined :: binary() | undefined
+ }).
+ 
+@@ -309,14 +310,16 @@ parse(_, State=#state{in_streamid=InStreamID, in_state=#ps_request_line{},
+ 	before_loop(State#state{buffer= <<>>});
+ parse(Buffer, State=#state{in_state=#ps_request_line{empty_lines=EmptyLines}}) ->
+ 	after_parse(parse_request(Buffer, State, EmptyLines));
+-parse(Buffer, State=#state{in_state=PS=#ps_header{headers=Headers, name=undefined}}) ->
++parse(Buffer, State=#state{in_state=PS=#ps_header{
++		headers=Headers, num_headers=Num, name=undefined}}) ->
+ 	after_parse(parse_header(Buffer,
+ 		State#state{in_state=PS#ps_header{headers=undefined}},
+-		Headers));
+-parse(Buffer, State=#state{in_state=PS=#ps_header{headers=Headers, name=Name}}) ->
++		Headers, Num));
++parse(Buffer, State=#state{in_state=PS=#ps_header{
++		headers=Headers, num_headers=Num, name=Name}}) ->
+ 	after_parse(parse_hd_before_value(Buffer,
+ 		State#state{in_state=PS#ps_header{headers=undefined, name=undefined}},
+-		Headers, Name));
++		Headers, Num, Name));
+ parse(Buffer, State=#state{in_state=#ps_body{}}) ->
+ 	after_parse(parse_body(Buffer, State)).
+ 
+@@ -541,32 +544,34 @@ parse_version(_, State, _, _, _, _) ->
+ 
+ before_parse_headers(Rest, State, M, A, P, Q, V) ->
+ 	parse_header(Rest, State#state{in_state=#ps_header{
+-		method=M, authority=A, path=P, qs=Q, version=V}}, #{}).
++		method=M, authority=A, path=P, qs=Q, version=V}}, #{}, 0).
+ 
+ %% Headers.
+ 
+ %% We need two or more bytes in the buffer to continue.
+-parse_header(Rest, State=#state{in_state=PS}, Headers) when byte_size(Rest) < 2 ->
+-	{more, State#state{buffer=Rest, in_state=PS#ps_header{headers=Headers}}};
+-parse_header(<< $\r, $\n, Rest/bits >>, S, Headers) ->
++parse_header(Rest, State=#state{in_state=PS}, Headers, Num) when byte_size(Rest) < 2 ->
++	{more, State#state{buffer=Rest, in_state=PS#ps_header{
++		headers=Headers, num_headers=Num}}};
++parse_header(<< $\r, $\n, Rest/bits >>, S, Headers, _) ->
+ 	request(Rest, S, Headers);
+-parse_header(Buffer, State=#state{opts=Opts, in_state=PS}, Headers) ->
++parse_header(Buffer, State=#state{opts=Opts, in_state=PS}, Headers, Num) ->
+ 	MaxHeaders = maps:get(max_headers, Opts, 100),
+-	NumHeaders = maps:size(Headers),
+ 	if
+-		NumHeaders >= MaxHeaders ->
+-			error_terminate(431, State#state{in_state=PS#ps_header{headers=Headers}},
++		Num >= MaxHeaders ->
++			error_terminate(431, State#state{in_state=PS#ps_header{
++					headers=Headers, num_headers=Num}},
+ 				{connection_error, limit_reached,
+ 					'The number of headers is larger than configuration allows. (RFC7230 3.2.5, RFC6585 5)'});
+ 		true ->
+-			parse_header_colon(Buffer, State, Headers)
++			parse_header_colon(Buffer, State, Headers, Num)
+ 	end.
+ 
+-parse_header_colon(Buffer, State=#state{opts=Opts, in_state=PS}, Headers) ->
++parse_header_colon(Buffer, State=#state{opts=Opts, in_state=PS}, Headers, Num) ->
+ 	MaxLength = maps:get(max_header_name_length, Opts, 64),
+ 	case match_colon(Buffer, 0) of
+ 		nomatch when byte_size(Buffer) > MaxLength ->
+-			error_terminate(431, State#state{in_state=PS#ps_header{headers=Headers}},
++			error_terminate(431, State#state{in_state=PS#ps_header{
++					headers=Headers, num_headers=Num}},
+ 				{connection_error, limit_reached,
+ 					'A header name is larger than configuration allows. (RFC7230 3.2.5, RFC6585 5)'});
+ 		nomatch ->
+@@ -574,14 +579,16 @@ parse_header_colon(Buffer, State=#state{opts=Opts, in_state=PS}, Headers) ->
+ 			%% so check if we have an LF and abort with an error if we do.
+ 			case match_eol(Buffer, 0) of
+ 				nomatch ->
+-					{more, State#state{buffer=Buffer, in_state=PS#ps_header{headers=Headers}}};
++					{more, State#state{buffer=Buffer, in_state=PS#ps_header{
++					headers=Headers, num_headers=Num}}};
+ 				_ ->
+-					error_terminate(400, State#state{in_state=PS#ps_header{headers=Headers}},
++					error_terminate(400, State#state{in_state=PS#ps_header{
++					headers=Headers, num_headers=Num}},
+ 						{connection_error, protocol_error,
+ 							'A header line is missing a colon separator. (RFC7230 3.2.4)'})
+ 			end;
+ 		_ ->
+-			parse_hd_name(Buffer, State, Headers, <<>>)
++			parse_hd_name(Buffer, State, Headers, Num, <<>>)
+ 	end.
+ 
+ match_colon(<< $:, _/bits >>, N) ->
+@@ -591,37 +598,38 @@ match_colon(<< _, Rest/bits >>, N) ->
+ match_colon(_, _) ->
+ 	nomatch.
+ 
+-parse_hd_name(<< $:, Rest/bits >>, State, H, SoFar) ->
+-	parse_hd_before_value(Rest, State, H, SoFar);
+-parse_hd_name(<< C, _/bits >>, State=#state{in_state=PS}, H, <<>>) when ?IS_WS(C) ->
+-	error_terminate(400, State#state{in_state=PS#ps_header{headers=H}},
++parse_hd_name(<< $:, Rest/bits >>, State, H, Num, SoFar) ->
++	parse_hd_before_value(Rest, State, H, Num, SoFar);
++parse_hd_name(<< C, _/bits >>, State=#state{in_state=PS}, H, Num, <<>>) when ?IS_WS(C) ->
++	error_terminate(400, State#state{in_state=PS#ps_header{headers=H, num_headers=Num}},
+ 		{connection_error, protocol_error,
+ 			'Whitespace is not allowed before the header name. (RFC7230 3.2)'});
+-parse_hd_name(<< C, _/bits >>, State=#state{in_state=PS}, H, _) when ?IS_WS(C) ->
+-	error_terminate(400, State#state{in_state=PS#ps_header{headers=H}},
++parse_hd_name(<< C, _/bits >>, State=#state{in_state=PS}, H, Num, _) when ?IS_WS(C) ->
++	error_terminate(400, State#state{in_state=PS#ps_header{headers=H, num_headers=Num}},
+ 		{connection_error, protocol_error,
+ 			'Whitespace is not allowed between the header name and the colon. (RFC7230 3.2.4)'});
+-parse_hd_name(<< C, Rest/bits >>, State, H, SoFar) ->
+-	?LOWER(parse_hd_name, Rest, State, H, SoFar).
+-
+-parse_hd_before_value(<< $\s, Rest/bits >>, S, H, N) ->
+-	parse_hd_before_value(Rest, S, H, N);
+-parse_hd_before_value(<< $\t, Rest/bits >>, S, H, N) ->
+-	parse_hd_before_value(Rest, S, H, N);
+-parse_hd_before_value(Buffer, State=#state{opts=Opts, in_state=PS}, H, N) ->
++parse_hd_name(<< C, Rest/bits >>, State, H, Num, SoFar) ->
++	?LOWER(parse_hd_name, Rest, State, H, Num, SoFar).
++
++parse_hd_before_value(<< $\s, Rest/bits >>, S, H, Num, N) ->
++	parse_hd_before_value(Rest, S, H, Num, N);
++parse_hd_before_value(<< $\t, Rest/bits >>, S, H, Num, N) ->
++	parse_hd_before_value(Rest, S, H, Num, N);
++parse_hd_before_value(Buffer, State=#state{opts=Opts, in_state=PS}, H, Num, N) ->
+ 	MaxLength = maps:get(max_header_value_length, Opts, 4096),
+ 	case match_eol(Buffer, 0) of
+ 		nomatch when byte_size(Buffer) > MaxLength ->
+-			error_terminate(431, State#state{in_state=PS#ps_header{headers=H}},
++			error_terminate(431, State#state{in_state=PS#ps_header{headers=H, num_headers=Num}},
+ 				{connection_error, limit_reached,
+ 					'A header value is larger than configuration allows. (RFC7230 3.2.5, RFC6585 5)'});
+ 		nomatch ->
+-			{more, State#state{buffer=Buffer, in_state=PS#ps_header{headers=H, name=N}}};
++			{more, State#state{buffer=Buffer, in_state=PS#ps_header{
++				headers=H, num_headers=Num, name=N}}};
+ 		_ ->
+-			parse_hd_value(Buffer, State, H, N, <<>>)
++			parse_hd_value(Buffer, State, H, Num, N, <<>>)
+ 	end.
+ 
+-parse_hd_value(<< $\r, $\n, Rest/bits >>, S, Headers0, Name, SoFar) ->
++parse_hd_value(<< $\r, $\n, Rest/bits >>, S, Headers0, Num, Name, SoFar) ->
+ 	Value = clean_value_ws_end(SoFar, byte_size(SoFar) - 1),
+ 	Headers = case maps:get(Name, Headers0, undefined) of
+ 		undefined -> Headers0#{Name => Value};
+@@ -629,9 +637,9 @@ parse_hd_value(<< $\r, $\n, Rest/bits >>, S, Headers0, Name, SoFar) ->
+ 		Value0 when Name =:= <<"cookie">> -> Headers0#{Name => << Value0/binary, "; ", Value/binary >>};
+ 		Value0 -> Headers0#{Name => << Value0/binary, ", ", Value/binary >>}
+ 	end,
+-	parse_header(Rest, S, Headers);
+-parse_hd_value(<< C, Rest/bits >>, S, H, N, SoFar) ->
+-	parse_hd_value(Rest, S, H, N, << SoFar/binary, C >>).
++	parse_header(Rest, S, Headers, Num + 1);
++parse_hd_value(<< C, Rest/bits >>, S, H, Num, N, SoFar) ->
++	parse_hd_value(Rest, S, H, Num, N, << SoFar/binary, C >>).
+ 
+ clean_value_ws_end(_, -1) ->
+ 	<<>>;
+diff --git a/cowboy/src/cowboy_req.erl b/cowboy/src/cowboy_req.erl
+index 4c155a9..b963eea 100644
+--- a/cowboy/src/cowboy_req.erl
++++ b/cowboy/src/cowboy_req.erl
+@@ -603,11 +603,9 @@ read_part(Req, Opts) ->
+ read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
+ 	try cow_multipart:parse_headers(Buffer, Boundary) of
+ 		more ->
+-			{Data, Req2} = stream_multipart(Req, Opts, headers),
+-			read_part(<< Buffer/binary, Data/binary >>, Opts, Req2);
++			read_part_more(Buffer, Opts, Req);
+ 		{more, Buffer2} ->
+-			{Data, Req2} = stream_multipart(Req, Opts, headers),
+-			read_part(<< Buffer2/binary, Data/binary >>, Opts, Req2);
++			read_part_more(Buffer2, Opts, Req);
+ 		{ok, Headers0, Rest} ->
+ 			Headers = maps:from_list(Headers0),
+ 			%% Reject multipart content containing duplicate headers.
+@@ -622,6 +620,16 @@ read_part(Buffer, Opts, Req=#{multipart := {Boundary, _}}) ->
+ 		}, ST)
+ 	end.
+ 
++%% We reject multipart header blocks that are twice the maximum
++%% size of the largest expected multipart header blocks.
++read_part_more(Buffer, _, _) when byte_size(Buffer) > 2048 ->
++	exit({request_error, {multipart, headers},
++		'Malformed body; multipart header block too large.'
++	});
++read_part_more(Buffer, Opts, Req0) ->
++	{Data, Req} = stream_multipart(Req0, Opts, headers),
++	read_part(<<Buffer/binary, Data/binary>>, Opts, Req).
++
+ -spec read_part_body(Req)
+ 	-> {ok, binary(), Req} | {more, binary(), Req}
+ 	when Req::req().
